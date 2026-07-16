@@ -120,6 +120,12 @@ void addAuthed(hci_con_handle_t conn_id)
     authedClients.insert(conn_id);
 }
 
+// Returns the number of currently active (authenticated) bluetooth connections
+int getBLEConnectedClientCount()
+{
+    return authedClients.size();
+}
+
 // code for checking if a client auth times out
 struct ClientTime
 {
