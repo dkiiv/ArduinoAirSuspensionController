@@ -43,4 +43,5 @@ extern Compressor *getCompressor();                            // defined in air
 extern bool isVehicleOn();                                     // defined in airSuspensionUtil.h
 extern bool isAnyWheelActive();                                // defined in airSuspensionUtil.h
 extern float readPinPressure(InputType *pin, bool heightMode); // defined in Wheel.h
+extern int getBLEConnectedClientCount();                       // defined in ble.h
 #endif

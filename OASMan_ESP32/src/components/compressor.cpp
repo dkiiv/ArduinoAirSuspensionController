@@ -114,6 +114,13 @@ void Compressor::loop()
         return;
     }
 
+    // if there are no active bluetooth connections, disable the compressor output
+    if (getBLEConnectedClientCount() == 0)
+    {
+        this->s_trigger.close();
+        return;
+    }
+
     // no matter which state compressor is in, check if it is up to max psi and turn it off if needed and return without any further execution. This is most important tank check and should ideally be ran first to turn off in any case where pressure is too high.
     if (this->getTankPressure() >= getcompressorOffPSI())
     {
