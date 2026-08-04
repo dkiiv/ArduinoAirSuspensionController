@@ -124,7 +124,6 @@ bool isAuthed(hci_con_handle_t conn_id)
 }
 void addAuthed(hci_con_handle_t conn_id)
 {
-    authedClients.insert(conn_id);
     if (authedClients.insert(conn_id).second) // .second is true only if this was a new entry
     {
         bleConnectedClientCount.fetch_add(1, std::memory_order_relaxed);
