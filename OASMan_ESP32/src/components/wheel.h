@@ -78,4 +78,5 @@ void setupWheelLockSem();
 extern bool canUseAiPrediction(SOLENOID_AI_INDEX aiIndex);
 extern double getAiPredictionTime(SOLENOID_AI_INDEX aiIndex, double start_pressure, double end_pressure, double tank_pressure);
 extern Manifold *getManifold(); // defined in airSuspensionUtil.h
+extern bool isVehicleOn(); // defined in airSuspensionUtil.h
 #endif

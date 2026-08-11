@@ -348,13 +348,12 @@ bool hasJustShutoff = true;
 void accessoryWireLoop()
 {
     bool previousVehicleOn = vehicleOn;
-    sampleReading(vehicleOn, accessoryWire->digitalRead() == HIGH, vehicleOnHistory, vehicleOnCounter, accessoryWireSampleSize);
+    sampleReading(vehicleOn, getBLEConnectedClientCount() > 0, vehicleOnHistory, vehicleOnCounter, accessoryWireSampleSize);
     if (isVehicleOn())
     {
         if (previousVehicleOn == false) {
             getAuxillaryOutput()->setDoStartupEvent(true);
         }
-        // accessory wire is supplying 12v (car on)
         notifyKeepAlive();
         hasJustShutoff = false;
     }
@@ -373,17 +372,12 @@ void accessoryWireLoop()
             }
         }
     }
-    if (isKeepAliveTimerExpired() || forceShutoff)
-    {
-        Serial.println("Shutting down");
-        outputKeepESPAlive->digitalWrite(LOW); // acc wire has been off for some time, shut down system
-        delay(500);
-    }
-    else
-    {
-        outputKeepESPAlive->digitalWrite(HIGH);
-    }
-    forceShutoff = false;
+    // Auto-off disabled: ACC is now driven by bluetooth connectivity rather than a physical
+    // accessory wire, so there's no external signal left to power the board back on if it fully
+    // shuts itself off here - it would be stranded until someone physically power-cycles it.
+    // Keep this pin held HIGH unconditionally instead of ever pulling it LOW.
+    outputKeepESPAlive->digitalWrite(HIGH);
+    forceShutoff = false; // no longer acted on, reset so a stale "true" doesn't linger
 }
 
 #else
