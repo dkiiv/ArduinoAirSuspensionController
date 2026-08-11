@@ -17,6 +17,9 @@ Adafruit_ADS1115 ADS1115D;
 bool ADS1115C_exists;
 bool ADS1115D_exists;
 
+bool bluetoothIgnitionEnabled = true; // if true, bluetooth connectivity will be used to determine if the vehicle is on or off.
+                                      // if false, the accessory wire will be used instead
+
 Manifold *getManifold()
 {
     return manifold;
@@ -348,7 +351,14 @@ bool hasJustShutoff = true;
 void accessoryWireLoop()
 {
     bool previousVehicleOn = vehicleOn;
-    sampleReading(vehicleOn, getBLEConnectedClientCount() > 0, vehicleOnHistory, vehicleOnCounter, accessoryWireSampleSize);
+    if (bluetoothIgnitionEnabled)
+    {
+        sampleReading(vehicleOn, getBLEConnectedClientCount() > 0, vehicleOnHistory, vehicleOnCounter, accessoryWireSampleSize);
+    }
+    else
+    {
+        sampleReading(vehicleOn, accessoryWire->digitalRead() == HIGH, vehicleOnHistory, vehicleOnCounter, accessoryWireSampleSize);
+    }
     if (isVehicleOn())
     {
         if (previousVehicleOn == false) {
@@ -372,12 +382,17 @@ void accessoryWireLoop()
             }
         }
     }
-    // Auto-off disabled: ACC is now driven by bluetooth connectivity rather than a physical
-    // accessory wire, so there's no external signal left to power the board back on if it fully
-    // shuts itself off here - it would be stranded until someone physically power-cycles it.
-    // Keep this pin held HIGH unconditionally instead of ever pulling it LOW.
-    outputKeepESPAlive->digitalWrite(HIGH);
-    forceShutoff = false; // no longer acted on, reset so a stale "true" doesn't linger
+    if (!bluetoothIgnitionEnabled && (isKeepAliveTimerExpired() || forceShutoff))
+    {
+        Serial.println("Shutting down");
+        outputKeepESPAlive->digitalWrite(LOW); // acc wire has been off for some time, shut down system
+        delay(500);
+    }
+    else
+    {
+        outputKeepESPAlive->digitalWrite(HIGH);
+    }
+    forceShutoff = false;
 }
 
 #else
