@@ -50,4 +50,5 @@ void trainAIModels();
 double getAiPredictionTime(SOLENOID_AI_INDEX aiIndex, double start_pressure, double end_pressure, double tank_pressure);
 bool canUseAiPrediction(SOLENOID_AI_INDEX aiIndex);
 void setupLEDs();
+extern int getBLEConnectedClientCount();                       // defined in ble.h
 #endif
