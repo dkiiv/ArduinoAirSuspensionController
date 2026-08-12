@@ -17,9 +17,6 @@ Adafruit_ADS1115 ADS1115D;
 bool ADS1115C_exists;
 bool ADS1115D_exists;
 
-bool bluetoothIgnitionEnabled = true; // if true, bluetooth connectivity will be used to determine if the vehicle is on or off.
-                                      // if false, the accessory wire will be used instead
-
 Manifold *getManifold()
 {
     return manifold;
