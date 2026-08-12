@@ -578,6 +578,13 @@ void Wheel::goalRoutine() {
 }
 
 void Wheel::maintainPressure() {
+    // don't correct pressure while the vehicle is off - avoids running initPressureGoal() below,
+    // which would otherwise read as a genuine failure and auto-disable this setting
+    if (!isVehicleOn())
+    {
+        return;
+    }
+
     // Maintain Pressure code
     if (getmaintainPressure())
     {
@@ -627,6 +634,13 @@ void Wheel::markInstability(float current) {
 }
 
 void Wheel::heightsensorlessLevelling() {
+    // don't self-level while the vehicle is off - avoids running initPressureGoal() below,
+    // which would otherwise read as a genuine failure and auto-disable this setting
+    if (!isVehicleOn())
+    {
+        return;
+    }
+
     // Sensorless levelling code
     // Holds ride HEIGHT without height sensors by inferring weight change from a sustained, stable
     // per-corner pressure change while parked. When a corner's settled pressure deviates from its

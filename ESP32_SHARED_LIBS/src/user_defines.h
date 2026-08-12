@@ -77,7 +77,7 @@
 
 // pass key is 6 digits, add zeros to the beginning of it to make it 6 in total
 // For example, if your pass is 2027 please type 002027
-#define BLE_PASSKEY 202777
+#define BLE_PASSKEY 202778
 
 /* turns on/off some test features for debug use. Best left false */
 #define TEST_MODE false
@@ -104,14 +104,14 @@
 #ifdef BOARD_VERSION_4_VALVE_PINOUT
 
 /* On board v4 the orientation of the connector physically is the same, but the pins they were connected too were optimized for routing */
-#define solenoidFrontPassengerInPin new InputType(18, OUTPUT)
-#define solenoidFrontPassengerOutPin new InputType(17, OUTPUT)
-#define solenoidRearPassengerInPin new InputType(19, OUTPUT)
-#define solenoidRearPassengerOutPin new InputType(33, OUTPUT)
-#define solenoidFrontDriverInPin new InputType(23, OUTPUT)
-#define solenoidFrontDriverOutPin new InputType(25, OUTPUT)
-#define solenoidRearDriverInPin new InputType(27, OUTPUT)
-#define solenoidRearDriverOutPin new InputType(26, OUTPUT)
+#define solenoidFrontDriverInPin     new InputType(18, OUTPUT)
+#define solenoidFrontDriverOutPin    new InputType(17, OUTPUT)
+#define solenoidRearDriverInPin      new InputType(19, OUTPUT)
+#define solenoidRearDriverOutPin     new InputType(33, OUTPUT)
+#define solenoidRearPassengerInPin   new InputType(23, OUTPUT)
+#define solenoidRearPassengerOutPin  new InputType(25, OUTPUT)
+#define solenoidFrontPassengerInPin  new InputType(27, OUTPUT)
+#define solenoidFrontPassengerOutPin new InputType(26, OUTPUT)
 
 #else
 
@@ -152,10 +152,10 @@ Wiring for 6 valve manifold on the boards valve connector. This will be the same
 */
 
 /* Pressure Sensor Inputs. Why are the ads pin nums in this specific order? Oh the world may never know */
-#define pressureSensorInput0 new InputType(0, &ADS1115A)             // ADSA/0   Previous: D36/VP/A4   Default: pressureInputFrontPassenger
-#define pressureSensorInput1 new InputType(3, &ADS1115A)             // ADSA/3   Previous: D35/A3      Default: pressureInputRearPassenger
-#define pressureSensorInput2 new InputType(2, &ADS1115A)             // ADSA/2   Previous: D34/A2      Default: pressureInputFrontDriver
-#define pressureSensorInput3 new InputType(1, &ADS1115A)             // ADSA/1   Previous: D39/VN/A7   Default: pressureInputRearDriver
+#define pressureSensorInput2 new InputType(0, &ADS1115A)             // ADSA/0   pressureInputFrontDriver
+#define pressureSensorInput3 new InputType(3, &ADS1115A)             // ADSA/3   pressureInputRearDriver
+#define pressureSensorInput1 new InputType(2, &ADS1115A)             // ADSA/2   pressureInputRearPassenger
+#define pressureSensorInput0 new InputType(1, &ADS1115A)             // ADSA/1   pressureInputFrontPassenger
 #define pressureSensorInput4_directesp32 new InputType(32, INPUT)    // D32/A0, pressure sensor        Default: pressureInputTank
 #define pressureSensorInput4_adsd1115d new InputType(0, &ADS1115D)   // ADSD/0, tank pressure sensor on 4.2 boards   Default: pressureInputTank
 
@@ -169,6 +169,8 @@ Wiring for 6 valve manifold on the boards valve connector. This will be the same
 #define outputKeepAlivePin new InputType(12, OUTPUT) // D12, output high while accessory input is low to keep input on. Should always output high while accessory is on. Output low when accessory is low to turn off system.
 #define accessoryInput new InputType(35, INPUT)      // D35 because it's adc1 input only //D14, digital in high or low. 0 = acc on, 1 = acc off (it's on a pullup resistor)
 #define SYSTEM_SHUTOFF_TIME_M 15                     // 15 minutes
+#define bluetoothIgnitionEnabled true                // if true, bluetooth connectivity will be used to determine if the vehicle is on or off.
+                                                     // if false, the accessory wire will be used instead
 
 /* E Brake Wire */
 #define ebrakeInput new InputType(34, INPUT)
@@ -191,10 +193,10 @@ Wiring for 6 valve manifold on the boards valve connector. This will be the same
 #define COMPRESSOR_CRANK_OFFSET_S 3
 
 /* Level sensor pins */
-#define levelInputFrontPassenger new InputType(0, &ADS1115B) // ADSB/0
-#define levelInputRearPassenger new InputType(3, &ADS1115B)  // ADSB/3
-#define levelInputFrontDriver new InputType(2, &ADS1115B)    // ADSB/2
-#define levelInputRearDriver new InputType(1, &ADS1115B)     // ADSB/1
+#define levelInputFrontDriver new InputType(0, &ADS1115B)    // ADSB/0
+#define levelInputRearDriver new InputType(3, &ADS1115B)     // ADSB/3
+#define levelInputRearPassenger new InputType(2, &ADS1115B)  // ADSB/2
+#define levelInputFrontPassenger new InputType(1, &ADS1115B) // ADSB/1
 
 /* ADS1115 I2C Addresses */
 #define ADS_A_ADDRESS 0x48 // 0x48 is address pin to low
