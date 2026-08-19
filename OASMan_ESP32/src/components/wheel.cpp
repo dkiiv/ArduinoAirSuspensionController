@@ -578,6 +578,11 @@ void Wheel::goalRoutine() {
 }
 
 void Wheel::maintainPressure() {
+    if (!isVehicleOn())
+    {
+        return;
+    }
+
     // Maintain Pressure code
     if (getmaintainPressure())
     {
