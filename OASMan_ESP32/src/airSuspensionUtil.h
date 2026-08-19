@@ -47,5 +47,4 @@ namespace PressureSensorCalibration
 }
 
 void setupLEDs();
-extern int getBLEConnectedClientCount();                       // defined in ble.h
 #endif
