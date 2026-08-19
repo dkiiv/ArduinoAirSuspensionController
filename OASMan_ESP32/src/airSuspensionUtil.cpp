@@ -358,14 +358,11 @@ bool hasJustShutoff = true;
 void accessoryWireLoop()
 {
     bool previousVehicleOn = vehicleOn;
-    if (bluetoothIgnitionEnabled)
-    {
-        sampleReading(vehicleOn, getBLEConnectedClientCount() > 0, vehicleOnHistory, vehicleOnCounter, accessoryWireSampleSize);
-    }
-    else
-    {
-        sampleReading(vehicleOn, accessoryWire->digitalRead() == HIGH, vehicleOnHistory, vehicleOnCounter, accessoryWireSampleSize);
-    }
+#if USE_BLUETOOTH_CONN_AS_ACCESSORY_ON
+    sampleReading(vehicleOn, getBLEConnectedClientCount() > 0, vehicleOnHistory, vehicleOnCounter, accessoryWireSampleSize);
+#else
+    sampleReading(vehicleOn, accessoryWire->digitalRead() == HIGH, vehicleOnHistory, vehicleOnCounter, accessoryWireSampleSize);
+#endif
     if (isVehicleOn())
     {
         if (previousVehicleOn == false) {
@@ -390,7 +387,11 @@ void accessoryWireLoop()
             }
         }
     }
-    if (!bluetoothIgnitionEnabled && (isKeepAliveTimerExpired() || forceShutoff))
+#if USE_BLUETOOTH_CONN_AS_ACCESSORY_ON
+    // vehicle on/off is driven by bluetooth connectivity, so keep the accessory output latched high
+    outputKeepESPAlive->digitalWrite(HIGH);
+#else
+    if (isKeepAliveTimerExpired() || forceShutoff)
     {
         Serial.println("Shutting down");
         outputKeepESPAlive->digitalWrite(LOW); // acc wire has been off for some time, shut down system
@@ -400,6 +401,7 @@ void accessoryWireLoop()
     {
         outputKeepESPAlive->digitalWrite(HIGH);
     }
+#endif
     forceShutoff = false;
 }
 
