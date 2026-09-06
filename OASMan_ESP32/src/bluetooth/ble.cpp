@@ -78,6 +78,22 @@ namespace packetMover
         giveRestSemaphore();
     }
 
+    // Drop every queued packet destined for a connection that is no longer
+    // alive. Called on DISCONNECTION_COMPLETE so a stale entry can't linger in
+    // the queue and later stall the notify loop (see att_server_notify_SAFE).
+    void clearPacketsForHandle(hci_con_handle_t con_handle)
+    {
+        waitRestSemaphore();
+        for (int i = 0; i < BTOASPACKETCOUNT; i++)
+        {
+            if (packets[i].taken && packets[i].con_handle == con_handle)
+            {
+                packets[i].taken = false;
+            }
+        }
+        giveRestSemaphore();
+    }
+
 };
 
 #pragma endregion
@@ -389,7 +405,13 @@ static void hci_event_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
     {
     case HCI_EVENT_DISCONNECTION_COMPLETE:
         log_i("Client disconnected!");
-        removeAuthed(hci_event_disconnection_complete_get_connection_handle(packet));
+        {
+            hci_con_handle_t dh = hci_event_disconnection_complete_get_connection_handle(packet);
+            removeAuthed(dh);
+            // Drop anything still queued for this (now-dead) connection so the
+            // notify loop never tries to send to a handle with no hci_connection.
+            packetMover::clearPacketsForHandle(dh);
+        }
         gap_advertisements_enable(1);
         break;
 
@@ -500,11 +522,28 @@ void ble_loop()
 
 uint8_t att_server_notify_SAFE(hci_con_handle_t con_handle, uint16_t attribute_handle, const uint8_t *value, uint16_t value_len)
 {
-
+    // Bounded wait for a send slot. The old version spun on
+    // `while (!att_server_can_send_packet_now(...)) delay(10);` with no exit.
+    // For a connection that has already dropped (web app tab closed / link
+    // loss) there is no hci_connection behind the handle, so
+    // att_server_can_send_packet_now() returns 0 forever and this task would
+    // hang for the rest of the boot. That stalls ble_loop() and therefore the
+    // notify path for every *other* client trying to authenticate (the in-car
+    // controller sees "Auth timed out" and refuses to connect).
+    //
+    // So: give up after a short deadline and drop the packet for that handle.
+    // att_server_notify() is a no-op for an unknown handle anyway.
+    const unsigned long start = millis();
+    const unsigned long timeoutMs = 250;
     while (!att_server_can_send_packet_now(con_handle))
     {
-        // log_i("\n\n\nCAN'T SEND PACKET\n\n\n");
-        delay(10);
+        if (millis() - start >= timeoutMs)
+        {
+            log_i("att_server_notify_SAFE: giving up on handle %04x after %lums", con_handle, (unsigned long)(millis() - start));
+            packetMover::clearPacketsForHandle(con_handle);
+            return ERROR_CODE_UNKNOWN_CONNECTION_IDENTIFIER;
+        }
+        delay(5);
     }
     return att_server_notify(con_handle, attribute_handle, value, value_len);
 }
