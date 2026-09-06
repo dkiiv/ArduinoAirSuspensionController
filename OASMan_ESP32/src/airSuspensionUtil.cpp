@@ -386,6 +386,25 @@ void accessoryWireLoop()
                 getAuxillaryOutput()->setDoShutdownEvent(true);
             }
         }
+#if USE_BLUETOOTH_CONN_AS_ACCESSORY_ON
+        // bluetooth ignition: while the vehicle is off, reboot the manifold if there
+        // are no connected bluetooth devices for BLE_NO_CONNECTION_REBOOT_TIMEOUT_MS
+        if (getBLEConnectedClientCount() == 0)
+        {
+            if (previousVehicleOn)
+            {
+                // vehicle just went off, start the no-connection timer
+                lastTimeLive = millis();
+            }
+            else if (millis() - lastTimeLive >= BLE_NO_CONNECTION_REBOOT_TIMEOUT_MS)
+            {
+                Serial.println("No bluetooth connections for "
+                                + String(BLE_NO_CONNECTION_REBOOT_TIMEOUT_MS / 60000)
+                                + " minutes while vehicle off, rebooting");
+                ESP.restart();
+            }
+        }
+#endif
     }
 #if USE_BLUETOOTH_CONN_AS_ACCESSORY_ON
     // vehicle on/off is driven by bluetooth connectivity, so keep the accessory output latched high

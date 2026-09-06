@@ -171,6 +171,8 @@ Wiring for 6 valve manifold on the boards valve connector. This will be the same
 #define SYSTEM_SHUTOFF_TIME_M 15                     // 15 minutes
 #define USE_BLUETOOTH_CONN_AS_ACCESSORY_ON false     // if true, bluetooth connectivity will be used to determine if the vehicle is on or off.
                                                      // if false, the accessory wire will be used instead
+#define BLE_NO_CONNECTION_REBOOT_TIMEOUT_MS 10 * 60 * 1000  // with bluetooth ignition, reboot the manifold if no connected
+                                                     // bluetooth devices for this long while the vehicle is off
 
 /* E Brake Wire */
 #define ebrakeInput new InputType(34, INPUT)
