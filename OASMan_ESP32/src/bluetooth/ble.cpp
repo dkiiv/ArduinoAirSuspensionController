@@ -111,13 +111,35 @@ static uint8_t rest_characteristic_data[BTOAS_PACKET_SIZE];
 static uint8_t valve_control_characteristic_data[4]; // 32-bit value
 
 std::set<hci_con_handle_t> authedClients;
+// Connection count is updated from the bluetooth task and read from other tasks
+// (accessory wire loop, compressor loop). Guarded by a FreeRTOS spinlock critical
+// section instead of std::atomic: the critical region is a single int read/write, so
+// it is only a few instructions on the ESP32, while remaining ISR-safe.
+static int bleConnectedClientCount = 0;
+static portMUX_TYPE bleConnectedClientCountMux = portMUX_INITIALIZER_UNLOCKED;
 bool isAuthed(hci_con_handle_t conn_id)
 {
     return std::find(authedClients.begin(), authedClients.end(), conn_id) != authedClients.end();
 }
 void addAuthed(hci_con_handle_t conn_id)
 {
-    authedClients.insert(conn_id);
+    if (authedClients.insert(conn_id).second) // .second is true only if this was a new entry
+    {
+        taskENTER_CRITICAL(&bleConnectedClientCountMux);
+        bleConnectedClientCount++;
+        taskEXIT_CRITICAL(&bleConnectedClientCountMux);
+    }
+}
+
+// Returns the number of currently active (authenticated) bluetooth connections.
+// A single int read under a FreeRTOS spinlock - a few instructions, safe to call from any task.
+int getBLEConnectedClientCount()
+{
+    int count;
+    taskENTER_CRITICAL(&bleConnectedClientCountMux);
+    count = bleConnectedClientCount;
+    taskEXIT_CRITICAL(&bleConnectedClientCountMux);
+    return count;
 }
 
 // code for checking if a client auth times out
@@ -175,6 +197,9 @@ void removeAuthed(hci_con_handle_t conn_id)
     {
         log_i("Removing auth from client: %i", conn_id);
         authedClients.erase(index);
+        taskENTER_CRITICAL(&bleConnectedClientCountMux);
+        bleConnectedClientCount--;
+        taskEXIT_CRITICAL(&bleConnectedClientCountMux);
         index = std::find(authedClients.begin(), authedClients.end(), conn_id);
     }
 
@@ -487,7 +512,7 @@ void ble_setup()
 void ble_loop()
 {
     static int prevConnectedCount = -1;
-    int connectedCount = authedClients.size();
+    int connectedCount = getBLEConnectedClientCount();
     if (connectedCount != prevConnectedCount)
     {
         Serial.printf("connectedCount: %d\n", connectedCount);

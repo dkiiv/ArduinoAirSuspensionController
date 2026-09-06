@@ -358,7 +358,11 @@ bool hasJustShutoff = true;
 void accessoryWireLoop()
 {
     bool previousVehicleOn = vehicleOn;
+#if USE_BLUETOOTH_CONN_AS_ACCESSORY_ON
+    sampleReading(vehicleOn, getBLEConnectedClientCount() > 0, vehicleOnHistory, vehicleOnCounter, accessoryWireSampleSize);
+#else
     sampleReading(vehicleOn, accessoryWire->digitalRead() == HIGH, vehicleOnHistory, vehicleOnCounter, accessoryWireSampleSize);
+#endif
     if (isVehicleOn())
     {
         if (previousVehicleOn == false) {
@@ -383,6 +387,10 @@ void accessoryWireLoop()
             }
         }
     }
+#if USE_BLUETOOTH_CONN_AS_ACCESSORY_ON
+    // vehicle on/off is driven by bluetooth connectivity, so keep the accessory output latched high
+    outputKeepESPAlive->digitalWrite(HIGH);
+#else
     if (isKeepAliveTimerExpired() || forceShutoff)
     {
         Serial.println("Shutting down");
@@ -393,6 +401,7 @@ void accessoryWireLoop()
     {
         outputKeepESPAlive->digitalWrite(HIGH);
     }
+#endif
     forceShutoff = false;
 }
 
