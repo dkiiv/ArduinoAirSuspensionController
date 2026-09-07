@@ -368,7 +368,6 @@ void accessoryWireLoop()
         if (previousVehicleOn == false) {
             getAuxillaryOutput()->setDoStartupEvent(true);
         }
-        // accessory wire is supplying 12v (car on)
         notifyKeepAlive();
         hasJustShutoff = false;
     }
