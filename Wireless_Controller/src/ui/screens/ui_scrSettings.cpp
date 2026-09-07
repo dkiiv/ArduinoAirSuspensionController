@@ -1,5 +1,8 @@
 #include "device_lib_exports.h"
 #include "ui_scrSettings.h"
+#include "utils/imu.h"
+#include "utils/auto_rotate.h"
+#include "utils/wake_on_movement.h"
 #include <stdint.h>
 
 #ifndef SCREEN_MODE_CIRCLE
@@ -70,6 +73,9 @@ static void alignWifiSsidList(lv_obj_t *dropdown)
 }
 
 // Current page tracking
+// The sensor-mode radio, so its capture-less option callback can revert the selection if the user
+// cancels the "AI data will be deleted" confirmation. Re-pointed on every screen construction.
+static RadioOption *s_heightSensorModeRadio = NULL;
 static lv_obj_t *current_page = NULL;
 static int saved_page_index = 0;  // Remember page selection across reinits
 static lv_obj_t *menu_container = NULL;
@@ -540,7 +546,7 @@ void ScrSettings::init(lv_obj_t *parent)
 
     allOptions.push_back(new Option(basic_settings_page, OptionType::BUTTON, "Reset Learned Data", {.STRING = test}, [](void *data)
     {
-        currentScr->showMsgBox("Reset Learned AI data?", "Run this if ai has completed training and you are getting innacurate presets.",
+        currentScr->showMsgBox("Reset Learned data?", "Run this if you are getting innacurate presets.",
             "Confirm", "Cancel",
             []() -> void
             {
@@ -555,11 +561,32 @@ void ScrSettings::init(lv_obj_t *parent)
     lv_obj_t *levelling_page = this->addSettingsPage(pages_container, true);
 
     const char *levelTypeRadioText[2] = {"Pressure Sensor", "Level Sensor"};
+    // The manifold only keeps AI training data for one sensor mode, so switching wipes it (see
+    // setheightSensorMode in manifoldSaveData.cpp). Confirm before sending. This only fires on a real user
+    // tap -- RadioOption::setSelectedOption returns early when the value is unchanged, and the config-echo
+    // path below calls it with callOnSelect = false.
     option_event_cb_t levelTypeRadioCB = [](void *data)
     {
-        setManifoldConfigValuesFlag(ConfigFlagsBit::CONFIG_HEIGHT_SENSOR_MODE, ((bool)data));
+        const bool wantHeightMode = ((bool)data);
+        currentScr->showMsgBox("Change Sensor Mode?",
+            "Learned data will be deleted.",
+            "OK", "Cancel",
+            [wantHeightMode]() -> void
+            {
+                setManifoldConfigValuesFlag(ConfigFlagsBit::CONFIG_HEIGHT_SENSOR_MODE, wantHeightMode);
+            },
+            [wantHeightMode]() -> void
+            {
+                // Cancelled: the radio already moved itself, so put the selection back.
+                if (s_heightSensorModeRadio != nullptr)
+                {
+                    s_heightSensorModeRadio->setSelectedOption(wantHeightMode ? 0 : 1);
+                }
+            }, true); // forceButtonPress: a tap-outside dismiss runs NEITHER callback, which would strand
+                      // the radio on the new mode while nothing was actually sent to the manifold.
     };
     this->ui_heightsensormode = new RadioOption(levelling_page, levelTypeRadioText, 2, levelTypeRadioCB);
+    s_heightSensorModeRadio = this->ui_heightsensormode;
 
     this->ui_calibrateMinHeight = new Option(levelling_page, OptionType::BUTTON, "Calibrate Min Height", {.STRING = test}, [](void *data)
     {
@@ -662,6 +689,21 @@ void ScrSettings::init(lv_obj_t *parent)
         setscreenDimTimeM((uint32_t)data);
     }));
 
+    #if WAKE_ON_MOVEMENT_SUPPORTED == 1
+    // Sits with the dim timeout it modifies, and deliberately outside the SUPPORTS_ROTATION
+    // block below - this needs an IMU, not a rotatable panel. Same two-level gate as Auto
+    // Rotate: the define says the board can have an IMU, imuAvailable() says this unit does.
+    if (imuAvailable())
+    {
+        allOptions.push_back(new Option(screen_settings_page, OptionType::ON_OFF, "Wake on Movement",
+            {.INT = getwakeOnMovement() ? 1 : 0}, [](void *data)
+        {
+            setwakeOnMovement((bool)data);
+        }));
+    }
+    #endif
+
+#if HAS_BRIGHTNESS_ADJUSTMENT
     this->ui_brightnessSlider = new Option(screen_settings_page, OptionType::SLIDER, "Brightness", {.INT = getbrightness()}, [](void *data)
     {
         log_i("Brightness %i", ((uint32_t)data));
@@ -669,7 +711,39 @@ void ScrSettings::init(lv_obj_t *parent)
         set_brightness(getBrightnessFloat());
     });
     ((Option *)this->ui_brightnessSlider)->setSliderParams(1, 100, false, LV_EVENT_VALUE_CHANGED);
+#else
+    // On/off backlight only -- a slider here would do nothing. See HAS_BRIGHTNESS_ADJUSTMENT.
+    this->ui_brightnessSlider = nullptr;
+#endif
 
+    allOptions.push_back(new Option(screen_settings_page, OptionType::HEADER, "Presets", {.STRING = ""}));
+
+    // Dropdown options are the newline-separated list "1\n2\n...MAX_PROFILE_COUNT"; selected index is count-1.
+    static_assert(MAX_PROFILE_COUNT <= 9, "preset count dropdown assumes single-digit labels");
+    static char presetCountOpts[MAX_PROFILE_COUNT * 2 + 1];
+    for (int i = 0; i < MAX_PROFILE_COUNT; i++)
+    {
+        presetCountOpts[i * 2] = (char)('1' + i);
+        presetCountOpts[i * 2 + 1] = '\n';
+    }
+    presetCountOpts[MAX_PROFILE_COUNT * 2 - 1] = '\0';
+
+    allOptions.push_back(new Option(screen_settings_page, OptionType::DROPDOWN_SELECT, "Preset Buttons",
+        {.INT = getPresetCount() - 1}, [](void *data)
+    {
+        int count = (int)(uintptr_t)data + 1;
+        if (count < 1)
+            count = 1;
+        if (count > MAX_PROFILE_COUNT)
+            count = MAX_PROFILE_COUNT;
+        if (count == getPresetCount())
+            return;
+        setpresetButtonCount((byte)count);
+        // The presets screen builds its buttons in init(), so it has to be rebuilt to pick this up.
+        runNextFrame([]() { reinitializeScreens(); });
+    }, (void *)presetCountOpts));
+
+#if HAS_BATTERY_SENSE_READING
     allOptions.push_back(new Option(screen_settings_page, OptionType::HEADER, "Status Bar", {.STRING = ""}));
     allOptions.push_back(new Option(screen_settings_page, OptionType::ON_OFF, "Show Battery", {.INT = getshowBattery() ? 1 : 0}, [](void *data)
     {
@@ -681,6 +755,7 @@ void ScrSettings::init(lv_obj_t *parent)
         globalStatusbar.setBatteryVisible(enabled);
 #endif
     }));
+#endif
 
 #ifndef SCREEN_MODE_CIRCLE
     allOptions.push_back(new Option(screen_settings_page, OptionType::HEADER, "Navigation", {.STRING = ""}));
@@ -698,20 +773,56 @@ void ScrSettings::init(lv_obj_t *parent)
     allOptions.push_back(new Option(screen_settings_page, OptionType::HEADER, "Screen Orientation", {.STRING = ""}));
 
     
-    this->ui_screenRotation = new Option(screen_settings_page, OptionType::BUTTON,
-        getscreenRotation() == 0 ? "Switch to Landscape" : "Switch to Portrait",
-        {.STRING = ""}, [](void *data)
+    // Entry order IS the saved rotation value (0 portrait, 1 landscape, 2 portrait flipped,
+    // 3 landscape flipped), so the dropdown index needs no translation either way.
+    // ; was: a BUTTON that toggled portrait<->landscape, which could not reach the two
+    // flipped orientations auto rotate now uses
+    static const char *orientationOptions = "Portrait\nLandscape\nPortrait 180\nLandscape 180";
+    this->ui_screenRotation = new Option(screen_settings_page, OptionType::DROPDOWN_SELECT, "Orientation",
+        {.INT = getscreenRotation() & 0x03}, [](void *data)
     {
-        byte currentRotation = getscreenRotation();
-        byte newRotation = (currentRotation == 0) ? 1 : 0;
+        byte newRotation = (byte)((uintptr_t)data & 0x03);
+
+        // Choosing an orientation by hand is a request to keep it, so auto rotate stands down
+        // rather than overriding the choice five seconds later.
+        bool turnedOffAutoRotate = false;
+        if (getautoRotate())
+        {
+            setautoRotate(false);
+            turnedOffAutoRotate = true;
+        }
+
+        if (newRotation == getscreenRotation())
+        {
+            // Same orientation already applied, so no rebuild to repaint the switch for.
+            // Sync it here instead; setBooleanValue does not re-enter the switch's own callback.
+            if (turnedOffAutoRotate && scrSettings.ui_autoRotate != NULL)
+                scrSettings.ui_autoRotate->setBooleanValue(false);
+            if (turnedOffAutoRotate)
+                showDialog("Auto rotate off", lv_color_hex(0xFFFF00));
+            return;
+        }
+
         setscreenRotation(newRotation);
-        ScrSettings *settings = (ScrSettings *)currentScr;
-        settings->ui_screenRotation->setRightHandText(newRotation == 0 ? "Switch to Landscape" : "Switch to Portrait");
         // Schedule screen reinit for next frame to allow rotation to complete
         runNextFrame([]() -> void {
             reinitializeScreens();
         });
-    });
+    }, (void *)orientationOptions);
+
+    #if AUTO_ROTATE_SUPPORTED == 1
+    // Only offer auto rotate if an IMU actually answered at boot. The define alone is not
+    // enough - it says the board *can* have one, imuAvailable() says this unit does.
+    if (imuAvailable())
+    {
+        this->ui_autoRotate = new Option(screen_settings_page, OptionType::ON_OFF, "Auto Rotate",
+            {.INT = getautoRotate() ? 1 : 0}, [](void *data)
+        {
+            setautoRotate((bool)data);
+        });
+        allOptions.push_back(this->ui_autoRotate);
+    }
+    #endif
     #endif
 
     // Theme colors setting
@@ -995,7 +1106,12 @@ void ScrSettings::init(lv_obj_t *parent)
 #endif
     allOptions.push_back(new Option(wifi_update_page, OptionType::TEXT_WITH_VALUE, "Version:", versionValue));
     this->ui_mac = new Option(wifi_update_page, OptionType::TEXT_WITH_VALUE, "Manifold:", {.STRING = ble_getMAC()});
+#if HAS_BATTERY_SENSE_READING
     this->ui_volts = new Option(wifi_update_page, OptionType::TEXT_WITH_VALUE, "Battery:", {.STRING = getBatteryVoltageString()});
+#else
+    // Nothing to report -- this board has no battery sense. See HAS_BATTERY_SENSE_READING.
+    this->ui_volts = nullptr;
+#endif
 
     // Restore previously selected page (or default to Status)
     if (saved_page_index < 0 || saved_page_index >= this->settingsPageCount) {
@@ -1119,7 +1235,8 @@ void ScrSettings::loop()
     this->ui_aiPercentage->setRightHandText(buf);
 
     this->ui_mac->setRightHandText(ble_getMAC());
-    this->ui_volts->setRightHandText(getBatteryVoltageString());
+    if (this->ui_volts)
+        this->ui_volts->setRightHandText(getBatteryVoltageString());
 
     // Update config values
     if (*util_configValues._setValues())
@@ -1194,6 +1311,7 @@ void ScrSettings::cleanup()
 #endif
     delete ui_safetymode;
     delete ui_heightsensormode;
+    s_heightSensorModeRadio = NULL;
     delete ui_calibrateMinHeight;
     delete ui_calibrateMaxHeight;
     delete ui_calibrateMinRideHeight;
@@ -1234,6 +1352,8 @@ void ScrSettings::cleanup()
     for (RadioOption* opt : allRadioOptions) {
         delete opt;
     }
+    // Non-owning alias into allOptions above; drop it so it cannot dangle before init() runs.
+    ui_autoRotate = nullptr;
     allOptions.clear();
     allRadioOptions.clear();
 }

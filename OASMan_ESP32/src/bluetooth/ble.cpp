@@ -120,6 +120,14 @@ void addAuthed(hci_con_handle_t conn_id)
     authedClients.insert(conn_id);
 }
 
+__attribute__((noinline))   // This is to prevent LTO from trying to inline this function and realizing that authedClients is never called from the same thread (explained below) and defaulting it to constant 0.
+                            // Specifically in the 'is vehicle on' call when BOARD_ALWAYS_ON_ACC_UNUSED_USE_BT_CONN_AS_VEHICLE_ON is true this function is used, and it is the only use in that thread so the threat of compiling as a const 0 is possible depending on the compiler. 
+                            // The reason this exists is because this is technically not a thread safe usage, but the risk is very low on the .size() call (no crash risk, just plus or minus 1 of the actual value in an edge case, and it's only compared to 0 in a sample of 5 so it is basically zero risk when used in that case).
+int getBLEConnectedClientCount()
+{
+    return authedClients.size();
+}
+
 // code for checking if a client auth times out
 struct ClientTime
 {
@@ -226,11 +234,37 @@ static uint16_t att_read_callback(hci_con_handle_t con_handle, uint16_t att_hand
 
 void runReceivedPacket(hci_con_handle_t con_handle, BTOasPacket *packet);
 
+// Last valve bitset written over the VALVECONTROL characteristic. File scope (was: a
+// static local inside att_write_callback) so the disconnect handler can release it.
+static unsigned int valveTableValues = 0;
+
+// Safety: a client can drop (out of range, app killed, battery dead) while it is still
+// holding a valve open, and nothing would ever write the closing bitset - leaving that
+// solenoid energized indefinitely. On any disconnect, force the bitset back to 0 and
+// close whatever it had open.
+static void releaseBleHeldValves()
+{
+    if (valveTableValues == 0)
+    {
+        return;
+    }
+
+    Serial.printf("Client disconnected with valve bitset %u still open, closing all\n", valveTableValues);
+    for (int i = 0; i < SOLENOID_COUNT; i++)
+    {
+        if ((valveTableValues >> i) & 1)
+        {
+            Serial.print("Closing ");
+            Serial.println(i);
+            getManifold()->get(i)->close();
+        }
+    }
+    valveTableValues = 0;
+}
+
 // ATT write callback
 static int att_write_callback(hci_con_handle_t con_handle, uint16_t att_handle, uint16_t transaction_mode, uint16_t offset, uint8_t *buffer, uint16_t buffer_size)
 {
-    static unsigned int valveTableValues = 0;
-
     if (att_handle == rest_characteristic_value_handle)
     {
         if (buffer_size == 0)
@@ -286,7 +320,7 @@ static int att_write_callback(hci_con_handle_t con_handle, uint16_t att_handle, 
             unsigned int valveControlBittset = *(unsigned int *)&valveControlBittsetArr; // little_endian_read_32(buffer, 0);
             Serial.printf("Value received for valve: %i\n", valveControlBittset);
 
-            for (int i = 0; i < 8; i++)
+            for (int i = 0; i < SOLENOID_COUNT; i++)
             {
                 bool prevVal = (valveTableValues >> i) & 1;
                 bool curVal = (valveControlBittset >> i) & 1;
@@ -390,6 +424,8 @@ static void hci_event_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
     case HCI_EVENT_DISCONNECTION_COMPLETE:
         log_i("Client disconnected!");
         removeAuthed(hci_event_disconnection_complete_get_connection_handle(packet));
+        // don't leave a valve open because the client disconnected mid-hold
+        releaseBleHeldValves();
         gap_advertisements_enable(1);
         break;
 
@@ -487,7 +523,7 @@ void ble_setup()
 void ble_loop()
 {
     static int prevConnectedCount = -1;
-    int connectedCount = authedClients.size();
+    int connectedCount = getBLEConnectedClientCount();
     if (connectedCount != prevConnectedCount)
     {
         Serial.printf("connectedCount: %d\n", connectedCount);

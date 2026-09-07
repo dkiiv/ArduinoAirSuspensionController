@@ -11,7 +11,7 @@
 #include "solenoid.h"
 #include "compressor.h"
 #include "manifoldSaveData.h"
-#include "../aiPressureUtil.h" // getPredictedBagPressure / getPredictedBagHeight
+#include "../aiPressureUtil.h" // getPredictedBagPressure / recordLearnSample
 
 class Manifold; // from manifold.h, forward reference
 
@@ -90,4 +90,5 @@ float readPinPressure(InputType *pin, bool heightMode);
 void setupWheelLockSem();
 
 extern Manifold *getManifold(); // defined in airSuspensionUtil.h
+extern bool isVehicleOn();      // defined in airSuspensionUtil.h
 #endif

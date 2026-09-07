@@ -41,29 +41,37 @@
 // Offset-model AI (samples -> refit -> predict -> fade). See OASMan_ESP32/AI_TRAINING.md.
 #define LEARN_SAVE_COUNT 300      // per-model on-disk sample capacity (was 500)
 #define OFFSET_DEFAULT_PSI 5      // constant offset used before a model is trained: -5 air-up, +5 air-out
+#define OFFSET_DEFAULT_LEVEL 2    // same, in height % (level mode reuses the same 4 models/files -- see AI_TRAINING.md)
 #define OFFSET_FADE_MIN 25        // start fading the trained model in at this many samples (0% -> ...)
 #define AI_LEARN_RATIO_NUM 150    // ...reaching 100% trained at this many samples (also the AIPercentage bar)
 #define SAMPLE_DEDUP_PSI 1        // drop a sample within this many psi (flowing AND settled) of the previous stored one
 
 // Closed-loop pressure control (see Wheel::goalRoutine / AI_TRAINING.md):
 #define PRESSURE_DEADBAND_PSI 0          // target the exact psi (the fine-pulse phase makes 0 safe); was: 1
-#define LEVEL_DEADBAND_PERCENTAGE 1
+#define LEVEL_DEADBAND_PERCENTAGE 0      // ; was: 1. exact %, now that level mode has the fine-pulse phase too
 
 // Settled-to-stable read (Wheel::waitForStableReading): block until the reading holds within the band for
 // SETTLE_STABLE_MS (SETTLE_MAX_WAIT_MS backstop). Used for every true valve-closed reading.
 #define SETTLE_STABLE_MS 100          // reading must hold steady this long to count as settled
 #define SETTLE_STABLE_BAND_PSI 1      // max psi wobble allowed while "stable"
-#define SETTLE_STABLE_BAND_LEVEL 2    // max height-% wobble allowed while "stable"
+#define SETTLE_STABLE_BAND_LEVEL 1    // ; was: 2. must be tight or a "stable" read can wobble wider than the 0 deadband demands -> hunting
 #define SETTLE_MAX_WAIT_MS 1500       // backstop: never block on a settle longer than this
 #define OFFSET_SAMPLE_SETTLE_MS 250      // manual-capture air-up: wait after the valve closes before reading the settled bag
 #define OFFSET_SAMPLE_SETTLE_DOWN_MS 500 // manual-capture air-out settles slower, so wait longer before the settled read
 
 // Fine-pulse precision phase (Wheel::achieveFineGoal): near-goal bursts that hone in on the exact psi,
 // shrinking on each goal crossing (anti-oscillation). On-car tuning knobs; design in AI_TRAINING.md.
-#define FINE_PULSE_THRESHOLD_PSI 5    // switch coarse -> fine within this many psi of goal
+#define FINE_PULSE_THRESHOLD_PSI 7    // switch coarse -> fine within this many psi of goal
 #define FINE_PULSE_MS_PER_PSI 5       // initial burst length per psi of remaining error
 #define FINE_PULSE_MIN_MS 5           // floor on the INITIAL burst size (the crossing-shrink can go below this)
 #define FINE_PULSE_MAX_MS 100         // cap on the initial burst size
+// Level-mode counterparts (height % instead of psi) -- level mode has no learned model, but it runs the
+// same fine phase, which works purely off accurate valve-closed readings. The chassis moves slower per ms
+// of valve than pressure does, hence the longer per-unit burst; all on-car tunable.
+#define FINE_PULSE_THRESHOLD_LEVEL 5  // switch coarse -> fine within this many height % of goal
+#define FINE_PULSE_MS_PER_LEVEL 5    // initial burst length per height % of remaining error
+#define FINE_PULSE_MIN_MS_LEVEL 5     // floor on the INITIAL burst size
+#define FINE_PULSE_MAX_MS_LEVEL 150   // cap on the initial burst size
 #define FINE_PULSE_OVERSHOOT_SHRINK 0.5 // burst multiplier on each goal crossing (< 1 = damp; give up when burst < 1 ms)
 #define FINE_PULSE_MAX_TRIES 8        // give up after this many bursts with the reading not moving (stuck: tank/bag exhausted)
 
@@ -169,6 +177,8 @@ Wiring for 6 valve manifold on the boards valve connector. This will be the same
 #define outputKeepAlivePin new InputType(12, OUTPUT) // D12, output high while accessory input is low to keep input on. Should always output high while accessory is on. Output low when accessory is low to turn off system.
 #define accessoryInput new InputType(35, INPUT)      // D35 because it's adc1 input only //D14, digital in high or low. 0 = acc on, 1 = acc off (it's on a pullup resistor)
 #define SYSTEM_SHUTOFF_TIME_M 15                     // 15 minutes
+#define BOARD_ALWAYS_ON_ACC_UNUSED_USE_BT_CONN_AS_VEHICLE_ON false     // if true, bluetooth connectivity will be used to determine if the vehicle is on or off.
+                                                     // if false, the accessory wire will be used instead
 
 /* E Brake Wire */
 #define ebrakeInput new InputType(34, INPUT)
