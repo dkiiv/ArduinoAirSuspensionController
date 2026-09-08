@@ -523,8 +523,11 @@ uint8_t att_server_notify_SAFE(hci_con_handle_t con_handle, uint16_t attribute_h
     const unsigned long timeoutMs = 500;
     while (!att_server_can_send_packet_now(con_handle))
     {
-        // log_i("\n\n\nCAN'T SEND PACKET\n\n\n");
-        delay(10);
+        if (millis() - start >= timeoutMs)
+        {
+            return ERROR_CODE_CONNECTION_TIMEOUT;
+        }
+        delay(5);
     }
     return att_server_notify(con_handle, attribute_handle, value, value_len);
 }
