@@ -78,9 +78,6 @@ namespace packetMover
         giveRestSemaphore();
     }
 
-    // Drop every queued packet destined for a connection that is no longer
-    // alive. Called on DISCONNECTION_COMPLETE so a stale entry can't linger in
-    // the queue and later stall the notify loop (see att_server_notify_SAFE).
     void clearPacketsForHandle(hci_con_handle_t con_handle)
     {
         waitRestSemaphore();
@@ -406,12 +403,12 @@ static void hci_event_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
     case HCI_EVENT_DISCONNECTION_COMPLETE:
         log_i("Client disconnected!");
         {
-            hci_con_handle_t dh = hci_event_disconnection_complete_get_connection_handle(packet);
-            removeAuthed(dh);
-            // Drop anything still queued for this (now-dead) connection so the
-            // notify loop never tries to send to a handle with no hci_connection.
-            packetMover::clearPacketsForHandle(dh);
+            hci_con_handle_t disconnected = hci_event_disconnection_complete_get_connection_handle(packet);
+            removeAuthed(disconnected);
+            packetMover::clearPacketsForHandle(disconnected);
         }
+        // don't leave a valve open because the client disconnected mid-hold
+        releaseBleHeldValves();
         gap_advertisements_enable(1);
         break;
 
@@ -522,28 +519,12 @@ void ble_loop()
 
 uint8_t att_server_notify_SAFE(hci_con_handle_t con_handle, uint16_t attribute_handle, const uint8_t *value, uint16_t value_len)
 {
-    // Bounded wait for a send slot. The old version spun on
-    // `while (!att_server_can_send_packet_now(...)) delay(10);` with no exit.
-    // For a connection that has already dropped (web app tab closed / link
-    // loss) there is no hci_connection behind the handle, so
-    // att_server_can_send_packet_now() returns 0 forever and this task would
-    // hang for the rest of the boot. That stalls ble_loop() and therefore the
-    // notify path for every *other* client trying to authenticate (the in-car
-    // controller sees "Auth timed out" and refuses to connect).
-    //
-    // So: give up after a short deadline and drop the packet for that handle.
-    // att_server_notify() is a no-op for an unknown handle anyway.
     const unsigned long start = millis();
-    const unsigned long timeoutMs = 250;
+    const unsigned long timeoutMs = 500;
     while (!att_server_can_send_packet_now(con_handle))
     {
-        if (millis() - start >= timeoutMs)
-        {
-            log_i("att_server_notify_SAFE: giving up on handle %04x after %lums", con_handle, (unsigned long)(millis() - start));
-            packetMover::clearPacketsForHandle(con_handle);
-            return ERROR_CODE_UNKNOWN_CONNECTION_IDENTIFIER;
-        }
-        delay(5);
+        // log_i("\n\n\nCAN'T SEND PACKET\n\n\n");
+        delay(10);
     }
     return att_server_notify(con_handle, attribute_handle, value, value_len);
 }
@@ -585,8 +566,15 @@ void ble_notify()
         delay(40); // This feels really shitty but it wants some delay here in-between packets or it won't send. So there is various delay's throught this file
         packet.dump();
         memcpy(rest_characteristic_data, packet.tx(), BTOAS_PACKET_SIZE);
-        att_server_notify_SAFE(rest_con_handle, rest_characteristic_value_handle, rest_characteristic_data, BTOAS_PACKET_SIZE);
-        Serial.println("Sent rest packet!");
+        uint8_t res = att_server_notify_SAFE(rest_con_handle, rest_characteristic_value_handle, rest_characteristic_data, BTOAS_PACKET_SIZE);
+        if (res == ERROR_CODE_CONNECTION_TIMEOUT) {
+            //Serial.println("Connection timeout, dropping packets for this connection!");
+            packetMover::clearPacketsForHandle(rest_con_handle); // clear here so it doesn't get stuck waiting 500ms for every packet in att_server_notify_SAFE
+        } else if (res == ERROR_CODE_SUCCESS) {
+            //Serial.println("Sent rest packet!");
+        } else {
+            //Serial.println("Error sending rest packet!");
+        }
         delay(40);
     }
 
