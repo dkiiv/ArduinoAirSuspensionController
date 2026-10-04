@@ -119,5 +119,34 @@ void loop()
         ESP.restart();
     }
 
+#ifdef DEBUG_HEIGHT_RAW
+    // Height-sensor diagnostic (manifold_v4_diag env): prints RAW pre-calibration readings
+    // plus the stored per-wheel cal points every ~500ms. raw is mapped 0.5-4.5V -> 0-100
+    // and is NOT clamped: >100 or <0 means out-of-range voltage at the ADC pin (floating
+    // input drifts high / lost sensor ground), which is electrical, never a cal artifact.
+    // CAL min==max (degenerate cal) means the app display is passing raw through unfiltered.
+    {
+        static const char *const cornerNames[4] = {"FP", "RP", "FD", "RD"};
+        static uint8_t dbgDivider = 0;
+        if (++dbgDivider >= 5) // loop ticks every 100ms -> print every ~500ms
+        {
+            dbgDivider = 0;
+            Serial.print(F("HRAW"));
+            for (int i = 0; i < 4; i++)
+            {
+                float raw = wheel[i]->readLevelSensorRaw();
+                Serial.printf(" %s=%.1f(%.2fV)", cornerNames[i], raw, 0.5f + (raw / 100.0f) * 4.0f);
+            }
+            Serial.print(F(" CAL"));
+            for (int i = 0; i < 4; i++)
+            {
+                Serial.printf(" %s[%.1f..%.1f]", cornerNames[i], getheightCalMin(i), getheightCalMax(i));
+            }
+            Serial.print(F(" HM="));
+            Serial.println(getheightSensorMode() ? 1 : 0);
+        }
+    }
+#endif
+
     delay(100);
 }
