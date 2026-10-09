@@ -8,7 +8,7 @@
 #if HEIGHT_CONTROL_SUPERVISOR
 
 #include <Arduino.h>
-#include <Preferences.h>
+#include <preferencable.h> // writeBytes / readBytes: the same SPIFFS store the pressure AI keeps its samples in
 #include <stdarg.h>
 #include "hcs_core.h"
 #include "../airSuspensionUtil.h"
@@ -20,8 +20,9 @@ static volatile bool evPreset = false;
 static volatile bool evManual = false;
 static uint8_t evPresetH[hcs::NC];
 
-static const char *const HCS_NVS_NS = "hcs";
-static const char *const HCS_NVS_KEY = "st";
+// Targets, references and learned values (fill rate, leak rate, last-trip road pressures). Kept forever, like the AI
+// samples: survives reboots and power loss; rejected only if its magic / version / ranges are wrong (Core::begin).
+static const char *const HCS_STATE_FILE = "/hcsState.bin";
 
 bool hcsOwnsHeightMaintain()
 {
@@ -61,14 +62,11 @@ static void hcsLog(const char *line)
 
 static bool loadPersist(hcs::PersistBlob &b)
 {
-    Preferences pr;
-    if (!pr.begin(HCS_NVS_NS, true))
+    if (!SPIFFS.exists(HCS_STATE_FILE))
     {
-        return false; // namespace not created yet (first boot with HCS)
+        return false; // first boot with HCS
     }
-    bool ok = pr.getBytesLength(HCS_NVS_KEY) == sizeof(b) && pr.getBytes(HCS_NVS_KEY, &b, sizeof(b)) == sizeof(b);
-    pr.end();
-    return ok; // magic / version / ranges are checked by Core::begin
+    return readBytes(HCS_STATE_FILE, &b, sizeof(b)) == sizeof(b); // magic / version / ranges: Core::begin
 }
 
 static void savePersist()
@@ -78,14 +76,7 @@ static void savePersist()
     {
         return;
     }
-    Preferences pr;
-    if (!pr.begin(HCS_NVS_NS, false))
-    {
-        Serial.println("HCS persist: nvs open failed");
-        return;
-    }
-    pr.putBytes(HCS_NVS_KEY, &b, sizeof(b));
-    pr.end();
+    writeBytes(HCS_STATE_FILE, &b, sizeof(b), "w");
 }
 
 static void buildInputs(hcs::Inputs &in)

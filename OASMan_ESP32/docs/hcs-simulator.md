@@ -36,6 +36,12 @@ HCS_DUMP_FROM=790000 HCS_DUMP_TO=800000 ./hcs_sim S1
 
 Runtime: all scenarios together take about five seconds of wall time and cover ~75 simulated hours.
 
+**What a check is for.** 47 checks over 17 scenarios. Each asserts one behaviour that no other check covers, or a precondition that stops a scenario from passing vacuously (e.g. "the confirmation rule was exercised"). Before keeping a check, break the rule it guards with a `-D` override and confirm the check fails. For example:
+- `-DHCS_CONFIRM_MS=0` fails S16;
+- `-DHCS_OWE_MAX=0.0f` (no drive-away top-up) fails S18 "level while still driving";
+- `-DHCS_URGENT_MAX_AGE_MS=0` fails S19 "lift starts the moment the controller connects";
+- `-DHCS_AUTO_LOWER=false` fails S4 (unload).
+
 ## The simulated car
 
 A **rigid body** (heave, pitch, roll) on four air springs, solved for static equilibrium every 100 ms.
@@ -84,15 +90,13 @@ Calibration is fixed at raw 10..90 with min ride 35. These are the gaps the fiel
 | S8 | car jacked at RP with the phone connected | EXTERNAL freeze; nothing moves; clears afterwards |
 | S9 | user jogs FD during an automatic rear correction | supervisor yields; only FD re-baselined |
 | S10 | fast leak (25 %/h) | latched after 3 fast refills; one refill per reconnect |
-| S11 | user parks on a stance preset below min ride | not lifted |
 | S11b | show preset 1 (0 % / 0 psi), people in and out | zero automatic actions; no false sensor fault |
-| S13 | rigid-body coupling with a leak | only the leaking corner refilled; all corners end within the deadband |
 | S14 | the owner's leak: RD compressed on the hill spot, 2 %/h, 24 h connected | never latched; RD held at its arrival height |
 | S15 | 4 h road trip with RD leaking 2.5 %/h | cruise pulses on RD only, never during a corner or brake; RD within 2 % of the others |
 | S16 | dips and the bottom of hills at speed: normal road, glass-smooth road, long highway sags; then real load after parking | no fill, dump or pulse in any case; the confirmation rule exercised and holding; weight after parking still compensated |
 | S17 | the shadow build: leak plus load for 2 h, phone connected | logs `SHADOW would START`; zero actuation; no leak bookkeeping from decisions that never ran |
 | S18 | get in and drive from the hill spot: no BLE overnight, trunk + passenger loaded with the car off, controller connects when the driver sits, drive off 8 s later; arrive on flat ground, or back on the crown; plus a "nobody drives off" variant | level plane back at the preset (twist removed) within the deadband after arrival; the crown's twist kept at home; prints the drive-away pulses and how fast the parked correction starts |
-| S19 | the owner's real spot (twist ~-33 %: FP 34, RP 87, FD 100, RD 23): park, night with an RD leak and no BLE, load with the car off, leave; arrive on flat ground, come back, or stay | nothing actuated at the spot (the hanging, unloaded wheel freezes it as EXTERNAL); hanging corners never dumped; on the road the load + leak are topped up; flat arrival level to the preset; back at the spot the twist is kept |
+| S19 | the owner's real spot (twist ~-33 %: FP 34, RP 87, FD 100, RD 23, both compressed corners below min ride): with the usual tank settings, and with the tank kept high; park, night with an RD leak and no BLE, load with the car off, leave; arrive on flat ground, come back, or stay | the min-ride lift is attempted on both corners, and any refusal (tank / bag ceiling) is logged; the lift starts the moment the controller connects; hanging corners never dumped; flat-ground arrival level to the preset |
 
 (S12, the valve/sensor cross-wiring scenario, was removed together with that check.)
 

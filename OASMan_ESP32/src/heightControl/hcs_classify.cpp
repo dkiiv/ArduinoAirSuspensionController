@@ -49,10 +49,10 @@ Cls Core::classify(const Inputs &in, int i, float hm, bool pOk, float pm, int lo
         }
         k.completeCls = Cls::NONE;
     }
-    // Below min ride / above the ceiling act only on AIR: a bag that lost air (leaked down overnight) or one we know
-    // nothing about is lifted; a corner pressed down or hanging off uneven ground with its air intact is terrain.
-    const bool airUnknown = !pOk || !finite_(k.airP);
-    if (hm < floorTrigger(in, i) && (airUnknown || airChg < 0))
+    // Min ride is a hard floor: below it the corner is lifted whatever put it there (leak, load, the ground), even if
+    // that raises the other corners too. Above the ceiling only a bag that gained air (heat) is lowered -- a corner
+    // hanging off uneven ground is held.
+    if (hm < floorTrigger(in, i))
     {
         dir = +1; // lift to the target, at least min ride + margin
         goal = fminf_(fmaxf_(k.tgt, liftTarget(in, i)), ch);
@@ -98,8 +98,9 @@ Cls Core::classify(const Inputs &in, int i, float hm, bool pOk, float pm, int lo
 }
 
 // Per-corner arbiter gates. Returns why a correction may not start, or nullptr.
-const char *Core::gate(const Inputs &in, int i, int8_t dir, bool pOk, float pm) const
+const char *Core::gate(const Inputs &in, int i, int8_t dir, bool pOk, float pm, bool floorLift) const
 {
+    const float headroom = floorLift ? HCS_TANK_HEADROOM_FLOOR_PSI : HCS_TANK_HEADROOM_PSI;
     const Corner &k = c[i];
     if ((now - k.lastCorrAt) < HCS_MIN_DWELL_MS)
         return "min dwell";
@@ -115,9 +116,9 @@ const char *Core::gate(const Inputs &in, int i, int8_t dir, bool pOk, float pm) 
         return "tank sensor invalid";
     if (pm >= in.bagCeilPsi - HCS_BAG_P_MARGIN)
         return "bag pressure ceiling";
-    if (pm + HCS_TANK_HEADROOM_PSI > in.compressorOffPsi)
+    if (pm + headroom > in.compressorOffPsi)
         return "tank can never reach headroom";
-    if (tank < pm + HCS_TANK_HEADROOM_PSI)
+    if (tank < pm + headroom)
         return "waiting for tank headroom";
     return nullptr;
 }
@@ -128,19 +129,20 @@ const char *Core::gate(const Inputs &in, int i, int8_t dir, bool pOk, float pm) 
 // and leaks change the plane, so they still show up against these targets.
 // Plane deficit: (targets' level plane) - (heights' level plane) at each corner, twist removed from both. > 0 means
 // the car sits low there for reasons other than the ground's twist (load, air). False if a height sensor is faulted.
-bool Core::planeDeficit(const float *h, float *d) const
+bool Core::planeDeficit(const float *h, float *d, const float *ref) const
 {
     static const float TW[NC] = {+1, -1, -1, +1};
-    float wT = 0, wH = 0;
+    float r[NC], wT = 0, wH = 0;
     for (int i = 0; i < NC; i++)
     {
-        if (c[i].hFault || !c[i].tgtValid)
+        if (c[i].hFault || (!ref && !c[i].tgtValid))
             return false;
-        wT += 0.25f * TW[i] * c[i].tgt;
+        r[i] = ref ? ref[i] : c[i].tgt;
+        wT += 0.25f * TW[i] * r[i];
         wH += 0.25f * TW[i] * h[i];
     }
     for (int i = 0; i < NC; i++)
-        d[i] = (c[i].tgt - TW[i] * wT) - (h[i] - TW[i] * wH);
+        d[i] = (r[i] - TW[i] * wT) - (h[i] - TW[i] * wH);
     return true;
 }
 
@@ -202,8 +204,7 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
         k.tgt = fminf_(hm[i], ceilH());
         k.pRef = k.pScale = pOk[i] ? pm[i] : NAN;
         k.airH = hm[i];
-        // no history: a corner already below min ride may have leaked there -> air unknown, so it gets lifted
-        k.airP = hm[i] < floorTrigger(in, i) ? NAN : k.pRef;
+        k.airP = k.pRef;
         k.tgtValid = true;
         logf("BASELINE %s init tgt=%.1f pRef=%.1f", CN[i], k.tgt, k.pRef);
         markPersist(false);
@@ -238,13 +239,13 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
     if (ext >= 0)
     {
         if (!externalFreeze)
-            logf("EXTERNAL %s bag lost %.0f%% of its pressure (jack / lift / wheel unsupported?) -> autonomous actuation frozen",
+            logf("EXTERNAL %s bag lost %.0f%% of its pressure (jack / lift / wheel hanging off uneven ground?) -> frozen, "
+                 "except lifting corners below min ride",
                  CN[ext], -extF * 100.0f);
-        externalFreeze = true;
-        st = State::PARKED;
-        return; // something else is holding the car: accept nothing, change nothing
+        externalFreeze = true; // something else holds the car: accept nothing, change nothing but the min-ride floor
+        extCorner = ext;
     }
-    if (externalFreeze)
+    else if (externalFreeze)
     {
         logf("EXTERNAL cleared");
         externalFreeze = false;
@@ -296,7 +297,23 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
         const float oldTgt = k.tgt;
         cls[i] = classify(in, i, hm[i], pOk[i], pm[i], loadDir, elsewhere, airChg[i], dir[i], goal[i]);
 
-        if (cls[i] == Cls::SHIFT)
+        if (k.roadPending && !externalFreeze &&
+            (cls[i] == Cls::WITHIN || cls[i] == Cls::SHIFT || cls[i] == Cls::COUPLED || cls[i] == Cls::AIR_GAIN || cls[i] == Cls::AMBIGUOUS))
+        {
+            if (fabsf(hm[i] - k.tgt) > HCS_DEADBAND_H && (hm[i] < k.tgt || HCS_AUTO_LOWER))
+            {
+                cls[i] = Cls::ROAD; // finish what the last drive said, whatever this spot makes it look like
+                dir[i] = hm[i] < k.tgt ? +1 : -1;
+                goal[i] = k.tgt;
+            }
+            else
+                k.roadPending = false;
+        }
+        if (externalFreeze && cls[i] != Cls::BOTTOM_GUARD)
+            dir[i] = 0; // frozen: only the min-ride floor may act
+        if (externalFreeze && (cls[i] == Cls::BOTTOM_GUARD) && i == extCorner)
+            dir[i] = 0; // never the unloaded corner itself
+        if (cls[i] == Cls::SHIFT && !externalFreeze)
         {
             // the surface the car is standing on: accept it as the new target, never fight it
             k.tgt = fminf_(hm[i], ceilH());
@@ -307,7 +324,7 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
             }
             markPersist(false);
         }
-        if (arrival && cls[i] == Cls::WITHIN && k.floorOverride < 0)
+        if (arrival && cls[i] == Cls::WITHIN && k.floorOverride < 0 && !externalFreeze)
         {
             k.tgt = fminf_(hm[i], ceilH()); // close to the preset plane: hold exactly where it arrived (anchored every arrival)
             if (pOk[i])
@@ -315,6 +332,26 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
                 k.airH = hm[i]; // the sign test only works against a reference taken on THIS spot
                 k.airP = pm[i];
             }
+            markPersist(false);
+        }
+        // The road is level on average: a corner that sat off the preset level for the whole last drive is off
+        // for an AIR reason (a leak hidden by the parking spot, air added at a severe spot, a top-up that over- or
+        // under-shot, load) -- correct it by that much. A deviation that only shows on this spot is terrain.
+        // Fills use the full deficit. Dumps use only the tilt part (common rise removed): heat lifts all four corners
+        // together and goes away as the bags cool, so it is never dumped.
+        const float heave = 0.25f * (c[0].roadDef + c[1].roadDef + c[2].roadDef + c[3].roadDef);
+        const float dumpBy = floorLifted ? k.roadDef                            // our own min-ride air: take it back
+                                         : fmaxf_(k.roadDef, k.roadDef - heave); // else the smaller dump (heat-safe)
+        const bool roadFill = k.roadDef > HCS_DEADBAND_H, roadDump = HCS_AUTO_LOWER && dumpBy < -HCS_DEADBAND_H;
+        if (arrival && roadDefValid && !externalFreeze && k.floorOverride < 0 && (roadFill || roadDump) &&
+            (cls[i] == Cls::WITHIN || cls[i] == Cls::SHIFT || cls[i] == Cls::COUPLED || cls[i] == Cls::AIR_GAIN ||
+             cls[i] == Cls::AMBIGUOUS))
+        {
+            cls[i] = Cls::ROAD;
+            dir[i] = roadFill ? +1 : -1;
+            goal[i] = hm[i] + (roadFill ? k.roadDef : dumpBy);
+            k.tgt = fminf_(fmaxf_(goal[i], 0), ceilH());
+            k.roadPending = true;
             markPersist(false);
         }
         if (cls[i] == Cls::AIR_LOSS || cls[i] == Cls::LOAD || cls[i] == Cls::UNLOAD)
@@ -338,6 +375,9 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
         k.lastCls = cls[i];
     }
 
+    if (arrival)
+        roadDefValid = floorLifted = false; // used once, on the parking right after that drive
+
     // ---- 6. event latch: while anything is pending, keep the load references (the evidence) frozen
     bool pending = false;
     for (int i = 0; i < NC; i++)
@@ -354,7 +394,7 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
         eventOpenSince = now;
     }
     for (int i = 0; i < NC; i++)
-        if (reref[i] && (!eventOpen || forceReref))
+        if (reref[i] && (!eventOpen || forceReref) && !externalFreeze)
             c[i].pRef = pm[i];
 
     // ---- 7. confirmation: steady since the last movement for HCS_CONFIRM_MS, or wanted twice that far apart.
@@ -400,7 +440,7 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
     {
         if (dir[i] == 0)
             continue;
-        const char *no = gate(in, i, dir[i], pOk[i], pm[i]);
+        const char *no = gate(in, i, dir[i], pOk[i], pm[i], cls[i] == Cls::BOTTOM_GUARD);
         if (no)
         {
             logq("  REFUSE %s %s %s: %s", CN[i], clsName(cls[i]), dir[i] > 0 ? "fill" : "dump", no);

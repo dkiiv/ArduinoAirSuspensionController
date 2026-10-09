@@ -249,6 +249,8 @@ void Core::motionDetect(const Inputs &in, uint32_t dt)
                 }
                 k.oweCand = 0;
             }
+            for (int i = 0; i < NC; i++)
+                c[i].roadPending = false; // a new drive decides afresh
             if (externalFreeze)
             {
                 externalFreeze = false; // a car on a jack / lift is not driving (an unloaded wheel was uneven ground)
@@ -272,6 +274,18 @@ void Core::motionDetect(const Inputs &in, uint32_t dt)
             for (int i = 0; i < NC; i++)
                 c[i].pRoad = c[i].sdP / sdN; // what the bags carried on the road this trip
             roadValid = true;
+            float hmean[NC], d[NC], ref[NC];
+            for (int i = 0; i < NC; i++)
+            {
+                hmean[i] = c[i].sdH / sdN;
+                ref[i] = presetValid ? (float)presetH[i] : c[i].tgt;
+            }
+            roadDefValid = planeDeficit(hmean, d, ref);
+            for (int i = 0; i < NC; i++)
+                c[i].roadDef = roadDefValid ? d[i] : 0;
+            if (roadDefValid)
+                logf("ROAD level vs preset (+ = sat low): FP %+.1f RP %+.1f FD %+.1f RD %+.1f", d[C_FP], d[C_RP], d[C_FD], d[C_RD]);
+            markPersist(false);
         }
         driving = false;
         needEval = true;

@@ -147,6 +147,11 @@
 #ifndef HCS_TANK_HEADROOM_PSI
 #define HCS_TANK_HEADROOM_PSI 20.0f // a fill needs tank >= bag + this
 #endif
+// Min-ride lifts accept a smaller margin: slower, but a corner pressed hard into a severe spot carries much more
+// than its usual load, so its bag can sit within 20 psi of the tank cut-off. Still strictly tank > bag (no back-flow).
+#ifndef HCS_TANK_HEADROOM_FLOOR_PSI
+#define HCS_TANK_HEADROOM_FLOOR_PSI 5.0f
+#endif
 
 // ---- pacing / watchdogs -----------------------------------------------------------------------------------
 #ifndef HCS_ROUTINE_TIMEOUT_MS
@@ -185,7 +190,7 @@
 #define HCS_BOOT_HOLD_MS 10000
 #endif
 #ifndef HCS_PERSIST_MIN_INTERVAL_MS
-#define HCS_PERSIST_MIN_INTERVAL_MS 60000 // NVS writes at most this often (except user commits)
+#define HCS_PERSIST_MIN_INTERVAL_MS 60000 // persistence-file writes at most this often (except user commits)
 #endif
 
 // ---- sensor faults (electrical only) ----------------------------------------------------------------------
@@ -283,6 +288,12 @@
 #endif
 #ifndef HCS_OWE_CALM_H
 #define HCS_OWE_CALM_H 2.0f // ESTIMATE: rough roads may need more (see STATS DRIVE)
+#endif
+// At the BLE-connect edge, a corner the last parked evaluation found below min ride (overnight leak) is lifted at
+// once -- people getting in do not wait for it, and driving off on a bottomed corner drags the frame. Only if that
+// evaluation is at most this old (parked evaluations run every 30 s, also with no BLE client).
+#ifndef HCS_URGENT_MAX_AGE_MS
+#define HCS_URGENT_MAX_AGE_MS 900000UL
 #endif
 #ifndef HCS_FILL_RATE_DEFAULT
 #define HCS_FILL_RATE_DEFAULT 2.0f // ESTIMATE: height % per second of open IN valve until learned from a parked fill

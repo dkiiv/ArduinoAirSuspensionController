@@ -53,7 +53,8 @@ enum class Cls : uint8_t
     AIR_GAIN,     // high and this bag gained air (thermal) -> hold, never dump
     UNLOAD,       // high, air unchanged, total load down -> lower (HCS_AUTO_LOWER)
     BOTTOM_GUARD, // below the calibrated minimum ride height -> lift
-    CEILING,      // above the autonomous ceiling -> lower (HCS_AUTO_LOWER)
+    CEILING,      // above the autonomous ceiling -> lower only if it gained air (HCS_AUTO_LOWER)
+    ROAD,         // after a drive: the road average said this corner sat off the preset level -> correct by that much
     FROZEN        // height sensor fault -> never actuated
 };
 
@@ -107,22 +108,28 @@ struct Outputs
     bool persistNow;
 };
 
-// Persisted (NVS) so a reboot does not forget what the car should hold. Range-checked on restore (begin()).
+// Persisted (SPIFFS file /hcsState.bin, the store the pressure AI keeps its samples in) so a reboot or power loss
+// forgets nothing: targets, references and learned values. Range-checked on restore (begin()).
 static const uint32_t PERSIST_MAGIC = 0x48435331; // "HCS1"
-static const uint8_t PERSIST_VERSION = 3;
+static const uint8_t PERSIST_VERSION = 4;
 struct PersistBlob
 {
     uint32_t magic;
     uint8_t version;
     uint8_t presetValid;
     uint8_t presetH[NC];
-    uint8_t reserved[2];
+    uint8_t roadValid;
+    uint8_t reserved;
     float tgt[NC];           // NAN = no target
     float floorOverride[NC]; // < 0 = none (user holds the corner below min ride, e.g. a show preset)
     float pRef[NC];
     float pScale[NC];
     float airH[NC];
     float airP[NC];
+    // learned (kept forever, restored even when the targets are rejected)
+    float fillRate[NC]; // height % per second of open IN valve; NAN = not learned yet
+    float leakRate[NC]; // smoothed %/h of the parked refills; NAN = none
+    float pRoad[NC];    // mean bag psi over the last drive (drive-load reference)
 };
 
 typedef void (*LogFn)(const char *line);
@@ -187,6 +194,8 @@ private:
         float batchGoal;
         float fillRate; // height % per second of open IN valve, learned from parked fills (cruise pulse sizing)
         float sdH, sdP; // drive-long sums for the drive-away load check
+        bool roadPending; // a ROAD correction decided on arrival, kept until this corner is within the deadband
+        float roadDef;  // last drive: preset level - road-average level here (twist removed); > 0 = sat low
         float pRoad;    // mean bag pressure over the last drive: a load reference that does not depend on a parking spot
         float calmLo, calmHi;
         float oweCand;  // fill the last parked evaluation wanted (height %), becomes owe when DRIVING is confirmed
@@ -228,7 +237,9 @@ private:
     // cruise
     uint32_t driveStartAt, steadySince, cruiseEvalAt, pulseEnd, oweAt, driveLoadAt;
     uint32_t sdN;
-    bool driveLoadDone, pulseOwe, roadValid;
+    bool driveLoadDone, pulseOwe, roadValid, urgentPending, urgentBatch, roadDefValid;
+    bool floorLifted; // a min-ride lift added air since the last arrival: the next road correction may take it back
+    int extCorner;
     uint32_t calmSince, pulseStartAt, pulseMs;
     float pulseStep;
     int driveLoadCnt;
@@ -255,6 +266,7 @@ private:
     void startBatch(const Inputs &in, Outputs &out, const bool *inB, const int8_t *dir, const float *goal, const Cls *cls,
                     const float *hm, const float *pm, const bool *pOk);
     void tickCorrecting(const Inputs &in, Outputs &out);
+    bool urgentFloorLift(const Inputs &in, Outputs &out);
     void finalizeBatch();
     void abortBatch(Outputs &out, const char *why, State next);
     void recordRefill(int i, float deficit);
@@ -271,9 +283,10 @@ private:
     void evaluate(const Inputs &in, Outputs &out, const char *kind, bool arrival);
     Cls classify(const Inputs &in, int i, float hm, bool pOk, float pm, int loadDir, bool airElsewhere, int8_t airChg,
                  int8_t &dir, float &goal);
-    const char *gate(const Inputs &in, int i, int8_t dir, bool pOk, float pm) const;
+    const char *gate(const Inputs &in, int i, int8_t dir, bool pOk, float pm, bool floorLift = false) const;
     void retargetArrival(const Inputs &in, const float *hm);
-    bool planeDeficit(const float *h, float *d) const; // per corner: target plane - current plane, twist removed
+    // per corner: reference plane - current plane, twist removed (reference: ref[] or the targets)
+    bool planeDeficit(const float *h, float *d, const float *ref = nullptr) const;
     uint32_t steadyRemaining() const; // 0 = every healthy corner steady for HCS_CONFIRM_MS; 0xFFFFFFFF = not steady
     // hcs_cruise.cpp
     void cruiseTick(const Inputs &in, Outputs &out);

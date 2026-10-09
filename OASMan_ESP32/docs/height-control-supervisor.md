@@ -10,7 +10,7 @@ Automatic ride-height holding for **height-sensor mode**:
 
 It is built for a car whose only knowledge of the world is four height sensors, four bag pressures, tank pressure, valve/compressor state and "is a BLE client connected". There is no speed, gear, door or IMU signal; everything is inferred.
 
-Status: **compiles (all envs), 72/72 bench-simulator checks pass (19 scenarios), NOT yet run on a car.** Thresholds marked ESTIMATE in `hcs_config.h` must be measured first; see [hcs-field-data.md](hcs-field-data.md).
+Status: **compiles (all envs), 47/47 bench-simulator checks pass (17 scenarios), NOT yet run on a car.** Thresholds marked ESTIMATE in `hcs_config.h` must be measured first; see [hcs-field-data.md](hcs-field-data.md).
 
 Bench simulator: [hcs-simulator.md](hcs-simulator.md).
 
@@ -36,7 +36,7 @@ wheel tasks (existing)                     supervisor task (new, 10 Hz)
 | `hcs_sense.cpp` | sample intake, electrical sensor faults, motion detector, STATS |
 | `hcs_classify.cpp` | evaluation: classify each corner, arbitrate, start one correction |
 | `hcs_cruise.cpp` | while driving: drive-away top-up (load added just before leaving) and cruise top-up (slow leak) |
-| `heightControlSupervisor.cpp` | ESP32 adapter: builds inputs, executes commands, NVS, diag dump |
+| `heightControlSupervisor.cpp` | ESP32 adapter: builds inputs, executes commands, persistence file, diag dump |
 
 The core has no Arduino includes; `eval/hcs_sim.cpp` compiles the same files on a PC. Cost when compiled in: about 3.1 KB RAM and 26 KB flash. The core does a few hundred float operations per 100 ms tick, which is negligible on an ESP32.
 
@@ -72,8 +72,9 @@ Physics: bag pressure carries the corner's load, and air mass sets the height at
 
 | Situation (e = h - target) | Class | Action |
 |---|---|---|
-| below min ride (or 5 % if uncalibrated) **and** this bag lost air, or its air history is unknown | BOTTOM_GUARD | lift to max(target, minRide + 3) |
+| below min ride (or 5 % if uncalibrated), for any reason: leak, load, the ground | BOTTOM_GUARD | lift to max(target, minRide + 3), even if that raises the other corners |
 | above 95 % + 3 | CEILING | hold; lower to 95 % only if this bag gained air (heat) |
+| after a drive: sat off the preset level on the road | ROAD | correct by that much (see Road level below) |
 | \|e\| <= 3 | WITHIN | none |
 | low, this bag lost air | AIR_LOSS | fill to target |
 | low, another bag's air changed | COUPLED | hold |
@@ -88,8 +89,10 @@ Supporting rules:
   - Uneven ground such as a crown is pure twist on a rigid car (one diagonal up, the other down), so it is kept and never corrected, and never carried to the next spot.
   - Load and leaks change the plane, so they still show up.
   - Corners within the deadband of these targets are then held exactly where they arrived, with a fresh air reference for this spot.
-  - **No load verdict on arrival.** The pressure references belong to the previous spot. On uneven ground the bags share the load differently (a hanging wheel carries almost nothing), so the pressures are not comparable. Arrival judges air (sign test) and safety only; load added before leaving is judged on the road (6a).
-- **Terrain is never "below min ride".** A corner pressed below min ride by the ground still has its air: pressure up, the sign test reads "same". It is left alone. Only a bag that lost air (or one with no history, e.g. a fresh board) is lifted. Likewise a hanging corner above the ceiling is held unless it gained air.
+  - **No load verdict on arrival.** The pressure references belong to the previous spot. On uneven ground the bags share the load differently (a hanging wheel carries almost nothing), so the pressures are not comparable. Load added before leaving is judged on the road instead (6a).
+  - **Road level (ROAD).** The road is level on average. So a corner that sat off the preset level for the whole last drive (twist removed) is off for an *air* reason, and is corrected by that much on arrival. Examples: a leak hidden by the parking spot, air added for a min-ride lift at a severe spot, a top-up that over- or under-shot. The correction stays pending until that corner is within the deadband. Fills use the full deficit. Dumps use only the tilt part, because heat lifts all four corners together and goes away as the bags cool. Exception: the common rise is dumped too when a min-ride lift added that air since the last arrival.
+- **Min ride is a hard floor.** A corner below the calibrated min ride is lifted whatever put it there (leak, load, a corner pressed down by uneven ground), even if that raises the other corners. A hanging corner above the ceiling is held unless it gained air (heat).
+- **Lift at connect.** When the BLE client connects, a corner that the last parked evaluation found below min ride (e.g. an overnight leak) is lifted at once. It does not wait for people to settle; only confirmed driving stops it, and the rest is then owed and topped up on the road (6a). Parked evaluations keep running with no client, so this decision is at most 30 s old.
 - **Confirmation.** A correction only starts once it has persisted 10 s with no motion: either every corner has stayed within 1.5 % since the last movement for 10 s, or two evaluations 10 s apart both want it. A dip or the bottom of a hill at speed compresses all four corners for a second or two (and moves them); a person or cargo stays. (Bench: with confirmation disabled, a long highway sag on a glass-smooth road triggers fills. With it, none.)
 - **Event latch.** While any correction is pending, the load references stay frozen, so correcting the first loaded corner cannot erase the evidence for the second.
 - **Completion pass.** A correction that lands more than 1 % short (routine timeout, tank) gets one follow-up.
@@ -100,12 +103,12 @@ Supporting rules:
 | Gate | Value |
 |---|---|
 | BLE client connected (`isVehicleOn()`) | required. No phone: nothing moves |
-| enabled, not safety mode, no FAULT, no EXTERNAL (jack / lift) | required |
+| enabled, not safety mode, no FAULT, no EXTERNAL (jack / lift; min-ride lifts excepted, never on the unloaded corner) | required |
 | corner sensor healthy; bag pressure valid for fills; tank sensor valid | required |
 | fill target <= 95 %; routine cut at 96 % on the live reading | hard |
 | dump target >= minRide + 3; routine cut 1 below | hard |
 | bag psi < min(bagMaxPressure, MAX_PRESSURE_SAFETY) - 10 | hard |
-| tank >= bag + 20 psi | hard |
+| tank >= bag + 20 psi (min-ride lifts: + 5 psi, slower but still strictly tank > bag) | hard |
 | confirmation (section 4) | required |
 | per-corner dwell 60 s; no up-then-down within 10 min without motion in between | no oscillation |
 | 8 corrections per hour (x 10 s routine timeout = 80 s of valve time per hour) | budget |
@@ -171,8 +174,8 @@ Bench S2: zero actuation.
 Bench S16: 15 min of sharp dips (normal and glassy) and long highway sags, with zero fills, dumps or pulses. Weight added after parking is still compensated (S16, S4).
 
 **Leak below min ride** (the reported bug: the legacy code never lifts it after a reboot, another corner's correction or a manual jog).
-- BOTTOM_GUARD lifts a corner below its floor whose bag lost air, or whose history is unknown (fresh board). A corner pressed down by the ground is left alone.
-- Targets persist in NVS, so after a reboot it lifts to the preset; with nothing persisted, to min ride + 3.
+- BOTTOM_GUARD lifts any corner below its floor; at a BLE connect it starts immediately.
+- Targets persist (SPIFFS file, like the pressure AI's samples), so after a reboot it lifts to the preset; with nothing persisted, to min ride + 3.
 
 Bench S3: overnight leak with no BLE and a reboot at 5 h. Nothing moves while the phone is away; when it connects, RD 34.4 -> 49.7 and the driver's load on FD is also compensated.
 
@@ -190,14 +193,14 @@ Result:
 - If nobody drives off, the first parked correction starts 11 s after the driver sat down, and fills toward the crown-shaped targets, not toward flat.
 - Before the arrival-target rule, the same trip ended at FP 61.9, RP 59.9, FD 54.3, RD 52.2: the stale crown targets were filled on flat ground.
 
-**The owner's real hill spot** (bench S19). Screen readings on the stock tesla branch: FD and RP 80-100 %, FP 30-35 %, RD 15-20 %, a twist of about -33 %. The sim reproduces it as FP 34, RP 87, FD 100, RD 23. One hanging wheel is nearly unloaded (bag pressure -46 %), and both compressed corners sit below min ride.
-- **At the spot:** a nearly unloaded wheel looks exactly like a corner on a jack, so EXTERNAL freezes everything. Nothing is corrected while parked there: no lift of the compressed corners, no dump of the hanging ones, no load correction.
-- **Leaving:** DRIVING clears the freeze. Load added at the spot (trunk, passenger, driver) plus RD's overnight leak are recognised on the road (DRIVE LOAD, about 90 s in) and topped up: 12 pulses in 15 min.
-- **Arriving on flat ground:** FP 50.7, RP 52.1, FD 48.3, RD 49.7 (preset 50).
-- **Back at the spot:** the twist (-33) is kept, the corners sit where an empty car arrived, and it freezes again.
-- **Load at the spot with nobody driving:** nothing happens until you drive.
-
-On a milder uneven spot (no wheel unloaded) the normal rules apply: the twist is accepted, terrain-compressed corners are not lifted, and hanging ones are not dumped.
+**The owner's real hill spot** (bench S19). Screen readings on the stock tesla branch: FD and RP 80-100 %, FP 30-35 %, RD 15-20 %, a twist of about -33 %. The sim reproduces it as FP 34, RP 87, FD 100, RD 23. One hanging wheel is nearly unloaded (bag pressure -46 %), and both compressed corners sit below min ride (35 in the sim).
+- **At the spot:** the nearly unloaded wheel looks like a jack, so EXTERNAL freezes everything except min-ride lifts. FP and RD are lifted toward min ride + 3 (raising the car, the hanging corners included); hanging corners are never dumped.
+- **The physics limit.** The car balances on the compressed diagonal, so lifting RD raises its bag pressure as it rises: about 166 psi at rest and about 185 during the lift in the sim, against 100 psi at the preset.
+  - With the tank cut-in / cut-out at 140 / 180 psi, the tank can never get above RD's bag, so the lift is refused and the reason is logged.
+  - With the tank kept at 180-200 psi, the lift runs, but it slows and stops at the bag pressure ceiling (200 safety - 10) before reaching min ride.
+  - Whether the real car can lift RD to min ride on that spot depends on RD's real psi there and the tank settings. Safety limits are never relaxed for it.
+- **Morning:** the controller connects with RD below min ride (overnight leak), and the lift starts at that moment, while people are still getting in.
+- **Leaving:** DRIVING clears the freeze. Load added at the spot is made up on the road. On arrival the road-level rule corrects what the spot hid (the lift air, the leak): flat ground ends at FP 50.1, RP 51.2, FD 48.8, RD 50.0 (preset 50).
 
 **Show preset (0 % / 0 psi).** It is user-held below min ride, so it is never lifted and never cruise-pulsed (S11b).
 
@@ -209,7 +212,7 @@ On a milder uneven spot (no wheel unloaded) the normal rules apply: the twist is
 | bag pressure out of range | < -12 or > 240 psi | no fills on that corner |
 | tank sensor out of range | same band | no fills |
 | >= 2 height faults | | FAULT, observe only |
-| jack / lift / wheel unsupported (including a wheel hanging off severe uneven ground) | any bag loses > 35 % of its pressure | EXTERNAL: everything frozen until it returns, or until DRIVING is confirmed |
+| jack / lift / wheel unsupported (including a wheel hanging off severe uneven ground) | any bag loses > 35 % of its pressure | EXTERNAL: everything frozen except min-ride lifts (never on the unloaded corner) until it returns, or until DRIVING is confirmed |
 
 Wiring a sensor or valve to the wrong corner is the installer's responsibility. It shows up as wrong vehicle behaviour, and the supervisor does not try to detect it.
 
@@ -220,7 +223,7 @@ Wiring a sensor or valve to the wrong corner is the installer's responsibility. 
 | user touches anything | abort; MANUAL; re-baseline only the touched corners |
 | crash / power loss mid-fill | solenoids de-energise closed; persisted targets restored; 120 s quiet before acting |
 | wheel task hangs with a valve open | supervisor watchdogs (12 s valve, 30 s correction) close it from the supervisor task |
-| bad / old NVS blob | rejected (magic, version, every field range-checked in `Core::begin`); starts unanchored |
+| bad / old persistence file | rejected (magic, version, every field range-checked in `Core::begin`); starts unanchored. Learned values (fill rate, leak rate, last-trip road pressures) are checked one by one and kept even if the targets are rejected |
 
 ## 9. Builds and rollout
 
@@ -242,6 +245,7 @@ Order: shadow (collect data, [hcs-field-data.md](hcs-field-data.md)) -> set thre
 | R1 | preset on level ground, connected 12 h | all corners within 3 % at the end, every correction logged | > 4 % off with no logged reason |
 | R2 | slow leak (your RD) | AIR_LOSS refills to target +-1 %; neighbours log COUPLED, not SHIFT | other corners actuated |
 | R2b | let a corner leak below min ride, power-cycle the manifold, connect | BOTTOM_GUARD lifts it to the preset | not lifted |
+| R2e | morning with RD below min ride (overnight leak): get in normally | `URGENT ... lifting now` within a second of the controller connecting; RD above min ride before you would drive | lift waits for people to settle, or RD still below min ride with no logged reason |
 | R2c | >= 2 h drive with the leak | `CRUISE RD ... watching`, then pulses on RD only, only in steady driving | pulse on another corner or during a corner / brake |
 | R3 | two adults into the rear; 10 kg in the trunk | rear back to preset +-1.5 % within 60 s; the 10 kg does nothing | front actuated |
 | R4 | park on the hill spot overnight (connect the phone for the test) | `ARRIVAL targets` with the twist, no correction at arrival; no correction that reduces the diagonal | any such correction |
@@ -265,7 +269,9 @@ Order: shadow (collect data, [hcs-field-data.md](hcs-field-data.md)) -> set thre
 | cruise leak signature | medium | pulses on a healthy corner, or none while a corner sinks |
 | drive-load check (total pressure up + level plane low on drive averages) | medium | `DRIVE LOAD` on a drive with nobody added (aero, long climbs, temperature), or pulses that overshoot on arrival |
 | crown handled as twist | medium-high | arrival on the hill spot logs LOAD / AIR_LOSS with nobody added, or corrections that change the twist |
-| the severe spot freezes as EXTERNAL | medium | the real hanging wheel keeps > 65 % of its pressure: then no freeze, and the normal terrain rules apply (also covered) |
+| the severe spot freezes as EXTERNAL | medium | the real hanging wheel keeps > 65 % of its pressure: then no freeze, and the normal rules apply (min-ride lifts either way) |
+| RD can be lifted to min ride on the severe spot | **unknown** | RD's psi on the spot vs the tank cut-in / cut-out and the bag ceiling (screen readings) |
+| road level as the arrival reference | medium | ROAD corrections after drives where nothing changed (a road that is not level on average, e.g. a commute that is mostly one long climb) |
 | road-average pressure as the load reference | medium | `DRIVE LOAD` without anyone added, e.g. after a drive in very different weather or on a long descent |
 | a car creeping at walking pace on glass-smooth floor is detected | **low** | bounded instead: confirmation, one axle, 10 s |
 

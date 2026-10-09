@@ -20,7 +20,7 @@ const char *Core::stateName(State s)
 const char *Core::clsName(Cls c)
 {
     static const char *const N[] = {"NONE",  "WITHIN",   "AIR_LOSS", "LOAD",         "SHIFT",   "COUPLED",
-                                    "AMBIG", "AIR_GAIN", "UNLOAD",   "BOTTOM_GUARD", "CEILING", "FROZEN"};
+                                    "AMBIG", "AIR_GAIN", "UNLOAD",   "BOTTOM_GUARD", "CEILING", "ROAD", "FROZEN"};
     return N[(int)c];
 }
 
@@ -102,7 +102,7 @@ void Core::begin(uint32_t t, const PersistBlob *r, bool sh, LogFn lf)
         Corner &k = c[i];
         k.idleSince = k.goodSinceH = k.goodSinceP = t;
         k.lastSeq = 0xFFFFFFFF;
-        k.pRef = k.pScale = k.airH = k.airP = k.leakRate = k.fillRate = NAN;
+        k.pRef = k.pScale = k.airH = k.airP = k.leakRate = k.fillRate = k.pRoad = NAN;
         k.floorOverride = -1;
         k.lastCorrAt = k.lastPulseAt = old;
         k.lastCorrEpisode = 0xFFFFFFFF;
@@ -113,6 +113,21 @@ void Core::begin(uint32_t t, const PersistBlob *r, bool sh, LogFn lf)
         logf("no persisted state -> starting unanchored (baseline = first settled reading)");
         return;
     }
+    // learned values: each range-checked on its own, kept even if the anchor state below is rejected
+    for (int i = 0; i < NC; i++)
+    {
+        Corner &k = c[i];
+        if (finite_(r->fillRate[i]) && r->fillRate[i] > 0.1f && r->fillRate[i] < 50.0f)
+            k.fillRate = r->fillRate[i];
+        if (finite_(r->leakRate[i]) && r->leakRate[i] >= 0 && r->leakRate[i] < 100.0f)
+            k.leakRate = r->leakRate[i];
+        k.pRoad = (finite_(r->pRoad[i]) && r->pRoad[i] >= HCS_P_MIN_VALID && r->pRoad[i] <= HCS_P_MAX_VALID) ? r->pRoad[i] : NAN;
+    }
+    roadValid = r->roadValid != 0;
+    for (int i = 0; i < NC; i++)
+        roadValid = roadValid && finite_(c[i].pRoad);
+    logf("RESTORED learned: fill rate %.2f/%.2f/%.2f/%.2f %%/s, leak %.2f/%.2f/%.2f/%.2f %%/h, road ref %s", c[0].fillRate, c[1].fillRate,
+         c[2].fillRate, c[3].fillRate, c[0].leakRate, c[1].leakRate, c[2].leakRate, c[3].leakRate, roadValid ? "yes" : "no");
     // Range-check every field before any of it can reach a target or a bound.
     bool ok = true;
     int nValid = 0;
@@ -173,8 +188,12 @@ bool Core::exportPersist(PersistBlob &b) const
         b.pScale[i] = k.pScale;
         b.airH[i] = k.airH;
         b.airP[i] = k.airP;
-        any = any || k.tgtValid;
+        b.fillRate[i] = k.fillRate;
+        b.leakRate[i] = k.leakRate;
+        b.pRoad[i] = k.pRoad;
+        any = any || k.tgtValid || finite_(k.fillRate) || finite_(k.leakRate);
     }
+    b.roadValid = roadValid ? 1 : 0;
     return any;
 }
 
@@ -283,6 +302,7 @@ void Core::tickInner(const Inputs &in, Outputs &out)
     {
         logf("PRESENCE on (BLE client connected) -> evaluate");
         needEval = true;
+        urgentPending = true;
         for (int i = 0; i < NC; i++)
             if (c[i].leakFault && !c[i].leakAllowance)
             {
@@ -291,7 +311,10 @@ void Core::tickInner(const Inputs &in, Outputs &out)
             }
     }
     else if (!in.presence && prevPresence)
+    {
         logf("PRESENCE off -> autonomous actuation vetoed");
+        urgentPending = false;
+    }
     prevPresence = in.presence;
     if (in.enabled != prevEnabled)
     {
@@ -327,6 +350,13 @@ void Core::tickInner(const Inputs &in, Outputs &out)
         manualSawDrive = manualSawDrive || driving;
         tickManual(in);
         if (manualActive)
+            return;
+    }
+
+    if (urgentPending)
+    {
+        urgentPending = false;
+        if (urgentFloorLift(in, out))
             return;
     }
 
@@ -443,6 +473,8 @@ void Core::tickManual(const Inputs &in)
         k.fastCount = 0;
         k.wantDir = 0;
         k.owe = k.oweCand = 0;
+        roadDefValid = false; // the user set a new level
+        k.roadPending = false;
         logf("COMMIT %s %s tgt=%.1f pRef=%.1f%s", CN[i], presetPending ? "preset" : "manual", k.tgt, k.pRef,
              k.floorOverride >= 0 ? " (user-held below min ride)" : "");
     }
@@ -516,6 +548,8 @@ void Core::startBatch(const Inputs &in, Outputs &out, const bool *inB, const int
         k.batchH0 = hm[i];
         k.batchGoal = goal[i];
         k.oweCand = 0;
+        if (cls[i] == Cls::BOTTOM_GUARD && dir[i] > 0)
+            floorLifted = true;
         k.batchP0 = pOk[i] ? pm[i] : NAN;
         k.batchOpenMs = 0;
         k.valveOpenSince = now;
@@ -539,8 +573,54 @@ void Core::abortBatch(Outputs &out, const char *why, State next)
         }
     logf("ABORT batch: %s", why);
     batchSettling = false;
+    urgentBatch = false;
     st = next;
     needEval = true;
+}
+
+// BLE-connect edge: a corner the last parked evaluation found below min ride (e.g. an overnight leak) is lifted right
+// away. Waiting for the car to be quiet would let the driver leave on a bottomed corner. Uses the live reading to
+// confirm it is still below the floor; all per-corner gates (tank, pressure ceiling, leak latch) still apply.
+bool Core::urgentFloorLift(const Inputs &in, Outputs &out)
+{
+    if (!in.presence || !in.enabled || in.safetyMode || driving || heightFaultCount() >= 2 || (now - lastEvalAt) > HCS_URGENT_MAX_AGE_MS)
+        return false;
+    bool inB[NC];
+    int8_t dir[NC];
+    float goal[NC], hm[NC], pm[NC];
+    bool pOk[NC];
+    Cls cls[NC];
+    int n = 0;
+    for (int i = 0; i < NC; i++)
+    {
+        Corner &k = c[i];
+        inB[i] = false;
+        dir[i] = 0;
+        cls[i] = Cls::NONE;
+        hm[i] = in.c[i].h;
+        pm[i] = in.c[i].p;
+        pOk[i] = !k.pFault;
+        goal[i] = k.tgt;
+        if (k.hFault || k.lastCls != Cls::BOTTOM_GUARD || in.c[i].h >= floorTrigger(in, i) || (externalFreeze && i == extCorner))
+            continue;
+        const char *no = gate(in, i, +1, pOk[i], pm[i], true);
+        if (no)
+        {
+            logf("URGENT lift %s refused: %s", CN[i], no);
+            continue;
+        }
+        inB[i] = true;
+        dir[i] = +1;
+        cls[i] = Cls::BOTTOM_GUARD;
+        goal[i] = fminf_(fmaxf_(k.tgt, liftTarget(in, i)), ceilH());
+        n++;
+    }
+    if (!n || batchesLastHour() >= HCS_MAX_BATCHES_PER_HOUR)
+        return false;
+    logf("URGENT controller connected with corners below min ride -> lifting now (does not wait for people to settle)");
+    startBatch(in, out, inB, dir, goal, cls, hm, pm, pOk);
+    urgentBatch = st == State::CORRECTING;
+    return out.cmd == Cmd::START || shadow;
 }
 
 void Core::tickCorrecting(const Inputs &in, Outputs &out)
@@ -554,11 +634,13 @@ void Core::tickCorrecting(const Inputs &in, Outputs &out)
             return abortBatch(out, "sensor fault on a corrected corner", State::PARKED);
     // the corners NOT being corrected watch for motion (drive-off, someone getting in)
     abortRun = (lastStrong >= 1 || lastVoting >= 2) ? abortRun + 1 : 0;
+    if (urgentBatch && !driving)
+        abortRun = 0; // min-ride lift at connect: people getting in do not stop it, driving off does (rest is owed)
     if (abortRun == 0 && !inEpisode)
         for (int i = 0; i < NC; i++)
             if (c[i].inBatch)
                 c[i].liveH = in.c[i].h; // height is not flow-affected (pressure is); a pulling-away car squats
-    if (inEpisode || abortRun >= HCS_ABORT_TICKS)
+    if ((inEpisode && (!urgentBatch || driving)) || abortRun >= HCS_ABORT_TICKS)
     {
         float hv[NC], d[NC];
         for (int i = 0; i < NC; i++)
@@ -597,6 +679,7 @@ void Core::tickCorrecting(const Inputs &in, Outputs &out)
 
 void Core::finalizeBatch()
 {
+    urgentBatch = false;
     for (int i = 0; i < NC; i++)
     {
         Corner &k = c[i];
@@ -615,6 +698,7 @@ void Core::finalizeBatch()
         {
             const float r = dh / (k.batchOpenMs / 1000.0f);
             k.fillRate = finite_(k.fillRate) ? 0.7f * k.fillRate + 0.3f * r : r;
+            markPersist(false); // learned: kept across reboots
         }
         logf("RESULT %s %s %+d: h %.1f->%.1f (tgt %.1f) p %+.1f, IN open %lu ms", CN[i], clsName(k.batchCls), k.batchDir, k.batchH0, hm,
              k.tgt, (pOk && finite_(k.batchP0)) ? pm - k.batchP0 : 0.0f, (unsigned long)k.batchOpenMs);
@@ -652,7 +736,10 @@ void Core::recordRefill(int i, float deficit)
         const float hrs = iv / 3600000.0f;
         const float rate = hrs > 0.01f ? deficit / hrs : NAN;
         if (finite_(rate))
+        {
             k.leakRate = finite_(k.leakRate) ? 0.7f * k.leakRate + 0.3f * rate : rate;
+            markPersist(false);
+        }
         k.fastCount = iv < HCS_LEAK_FAST_INTERVAL_MS ? k.fastCount + 1 : 0;
         logf("LEAK %s refill: %.1f%% after %.1fh (~%.2f %%/h, smoothed %.2f %%/h)%s", CN[i], deficit, hrs, rate, k.leakRate,
              k.fastCount ? " FAST" : "");

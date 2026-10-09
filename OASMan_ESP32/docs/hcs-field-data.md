@@ -109,8 +109,13 @@ Known so far:
 - Travel: about 1 ft (~300 mm) from 0 psi on the bump stops to max pressure. So 1 % of calibrated travel is ~3 mm: the 3 % deadband is ~9 mm, and the 0.7 % motion threshold ~2 mm.
 - Tank 4 gal; two 480C-type compressors.
 - Phone not connected overnight; the in-car controller connects when the car powers up. So "BLE connected" means "car in use", and nothing is corrected while the car sleeps (leaks are logged and corrected at the next power-up).
-- The manifold runs 24/7 (constant 12 V), so its state stays in RAM between trips (learned fill rates, last-trip road pressures). The supervisor's timing is wrap-safe across the 49.7-day `millis()` rollover. The few legacy comparisons that are not only misbehave in a window of seconds at the wrap (an early timeout).
+- The manifold runs 24/7 (constant 12 V). Everything the supervisor learns (targets, fill rate and leak rate per corner, last-trip road pressures) is also written to a SPIFFS file, the same store the pressure AI keeps its samples in, so a reboot or power loss loses nothing. The supervisor's timing is wrap-safe across the 49.7-day `millis()` rollover. The few legacy comparisons that are not only misbehave in a window of seconds at the wrap (an early timeout).
 - Home spot: FD and RP read 80-100 %, FP 30-35 %, RD 15-20 % (stock tesla branch screen).
+
+Needed next (screen readings, car parked on the hill spot, nobody in it):
+- the psi of all four bags, especially RD, plus the tank psi. On that spot RD carries far more than its usual load. A min-ride lift needs the tank at least 5 psi above RD's bag, and RD's bag must stay under the pressure ceiling (200 safety - 10) while it lifts;
+- the compressor cut-in / cut-out psi set in the app;
+- the calibrated min ride per corner.
 
 Still useful:
 - the per-corner travel, if the front and rear differ;
