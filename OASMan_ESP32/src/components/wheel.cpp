@@ -866,9 +866,59 @@ void Wheel::pressureCaptureBaseline()
     }
 }
 
+bool Wheel::startAutonomousPulse(uint16_t ms, float ceilP)
+{
+#if HEIGHT_CONTROL_SUPERVISOR
+    if (ms == 0 || ms > 2000 || this->isRoutineFlagged() || getInSolenoid()->isOpen() || getOutSolenoid()->isOpen())
+    {
+        return false;
+    }
+    if (ceilP > MAX_PRESSURE_SAFETY)
+    {
+        ceilP = MAX_PRESSURE_SAFETY;
+    }
+    this->readInputs();
+    if (this->pressureValue >= ceilP)
+    {
+        return false;
+    }
+    this->autoPulseCeilP = ceilP;
+    this->autoPulseDeadline = millis() + ms;
+    this->autoPulse = true; // before opening: the offset-sample logger must never see this as a manual move
+    getOutSolenoid()->close();
+    getInSolenoid()->open();
+    return true;
+#else
+    return false;
+#endif
+}
+
+void Wheel::endAutonomousPulse()
+{
+    if (this->autoPulse)
+    {
+        this->autoPulse = false;
+        getInSolenoid()->close();
+    }
+}
+
+void Wheel::autonomousPulseService()
+{
+    if (!this->autoPulse)
+    {
+        return;
+    }
+    if ((int32_t)(millis() - this->autoPulseDeadline) >= 0 || this->pressureValue >= this->autoPulseCeilP || this->isRoutineFlagged() ||
+        getOutSolenoid()->isOpen())
+    {
+        this->endAutonomousPulse();
+    }
+}
+
 void Wheel::loop()
 {
     this->readInputs();
+    this->autonomousPulseService();
     this->goalRoutine();
     this->trackPressureStability();
     this->pressureCaptureBaseline();
@@ -882,7 +932,7 @@ void Wheel::loop()
 // active; skipped while a goal routine runs (it collects its own). See AI_TRAINING.md.
 void Wheel::captureManualOffsetSample()
 {
-    if (flagStartPressureGoalRoutine[thisWheelNum].load())
+    if (flagStartPressureGoalRoutine[thisWheelNum].load() || this->autoPulse)
     {
         manualValveWasOpen = false;
         manualSettleUntil = 0;

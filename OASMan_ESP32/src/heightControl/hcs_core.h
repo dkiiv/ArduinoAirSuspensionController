@@ -48,6 +48,7 @@ enum class Cls : uint8_t
     AIR_LOSS,     // low, bag pressure did not rise: air mass lost (leak / cooling) -> fill
     LOAD,         // low, pressure up, total vehicle load up -> fill
     SHIFT,        // load moved between corners at ~constant total (terrain, crown, slope, cornering, someone moved) -> accept
+    COUPLED,      // displaced because ANOTHER bag's air changed (rigid body) -> hold: it comes back when that one is fixed
     AMBIGUOUS,    // contradicting evidence -> hold, do nothing
     AIR_GAIN,     // high, pressure did not drop (thermal expansion) -> hold, never dump
     UNLOAD,       // high, pressure down, total load down -> lower (if HCS_AUTO_LOWER)
@@ -96,7 +97,8 @@ enum class Cmd : uint8_t
 {
     NONE,
     START, // start autonomous goals for the corners with g[i].active
-    ABORT  // abort autonomous goals / close valves on the corners with g[i].active
+    ABORT, // abort autonomous goals / close valves on the corners with g[i].active
+    PULSE  // cruise top-up: open the IN valve of the g[i].active corner for g[i].pulseMs, then close
 };
 
 struct GoalRequest
@@ -107,6 +109,7 @@ struct GoalRequest
     float ceilH;    // routine must stop filling at/above this height
     float floorH;   // routine must stop dumping at/below this height
     float ceilP;    // routine must stop filling at/above this (raw, flow-inflated) bag psi
+    uint16_t pulseMs;
 };
 
 struct Outputs
@@ -118,7 +121,7 @@ struct Outputs
 
 // Persisted (NVS) so a reboot / OTA / brownout does not forget what the car is supposed to be holding.
 static const uint32_t PERSIST_MAGIC = 0x48435331; // "HCS1"
-static const uint8_t PERSIST_VERSION = 1;
+static const uint8_t PERSIST_VERSION = 2; // v2: + air reference, learned L0
 struct PersistBlob
 {
     uint32_t magic;
@@ -130,6 +133,9 @@ struct PersistBlob
     float pRef[NC];
     float floorOverride[NC]; // < 0 = none
     float pScale[NC];
+    float airP[NC];
+    float airH[NC];
+    float L0[NC];
 };
 
 typedef void (*LogFn)(const char *line);
@@ -176,11 +182,26 @@ private:
         bool tgtValid;
         float tgt, pRef, floorOverride;
         float pScale; // load-proportional normaliser for the total-load test; set on commits, NEVER on SHIFT accepts
+        float airP, airH;  // air-content reference: the (p, h) pair when this bag's air was last known-good
+        uint32_t airAt;    // when the air reference was taken
+        float L0;          // learned bag volume offset (height-% units)
+        int l0n;           // number of L0 learning samples
+        float fillRate;    // learned parked fill rate, height % per second of valve-open time (NAN = unknown)
+        uint32_t batchOpenMs;
+        float hL, pL, hS;  // cruise: 2-min height / pressure averages, 1-s height average
+        float hC, pC;      // cruise reference: the 2-min averages once the trip has settled (minute 10)
+        bool cruiseInit, cruiseRef;
+        uint32_t cruiseLowSince;
+        bool cruiseLow;
+        int cruiseCnt; // leaky evidence counter: +1 per low 10-s evaluation, -1 otherwise
+        uint32_t lastPulseAt;
         uint32_t lastCorrAt;
         int8_t lastCorrDir;
         uint32_t lastCorrEpisode;
-        uint32_t leakT[HCS_LEAK_FAULT_COUNT];
-        int leakN;
+        uint32_t lastRefillAt;
+        bool haveRefill;
+        int fastCount;
+        float leakRate; // smoothed estimate, height % per hour (logged; diagnostics only)
         bool leakFault, leakAllowance;
         bool touched;
         // batch
@@ -199,7 +220,7 @@ private:
     State st;
     bool shadow;
     LogFn logFn;
-    uint32_t now, bootAt;
+    uint32_t now, bootAt, lastDt;
 
     // motion
     bool inEpisode, driving, armedAfterDrive, bootPending;
@@ -207,6 +228,20 @@ private:
     int lastIncluded, lastVoting, lastStrong, motionRun, abortRun;
     bool eventOpen;
     uint32_t eventOpenSince;
+    // cruise top-up
+    uint32_t driveStartAt, steadySince, cruiseEvalAt, pulseEnd;
+    bool steady;
+    int pulseCorner;
+    uint32_t pulseT[HCS_CRUISE_MAX_PER_HOUR];
+    int pulseI;
+    float cruiseRoll, cruisePitch;
+    void cruiseTick(const Inputs &in, Outputs &out);
+    // field statistics (see HCS_STATS_PERIOD_MS)
+    uint16_t stH[2][NC][6], stP[2][NC][6];
+    double sqN[NC], sqH[NC], sqH2[NC], sqP[NC], sqP2[NC];
+    uint32_t statsAt;
+    void statsSample(const Inputs &in, const bool *inc);
+    void statsFlush();
 
     // evaluation
     bool needEval;
@@ -233,7 +268,7 @@ private:
     bool manualIdle;
 
     // batch
-    uint32_t batchStart, settleStart;
+    uint32_t batchStart, settleStart, batchFillMs;
     bool batchSettling;
     uint32_t batchT[HCS_MAX_BATCHES_PER_HOUR];
     int batchI;
@@ -267,6 +302,9 @@ private:
     void tickCorrecting(const Inputs &in, Outputs &out);
     void finalizeBatch(const Inputs &in);
     void abortBatch(Outputs &out, const char *why, State next);
+    void recordRefill(int i, float deficit);
+    void setAirRef(int i, float p, float h);
+    float airDelta(int i, float p, float h) const; // fractional air-content change vs reference (NAN if unknown)
     void tickManual(const Inputs &in);
     void enterManual(const Inputs &in, const char *why, Outputs &out);
     void markPersist(bool immediate);

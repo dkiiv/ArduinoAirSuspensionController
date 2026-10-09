@@ -46,6 +46,7 @@ const char *Core::clsName(Cls c)
     case Cls::AIR_LOSS: return "AIR_LOSS";
     case Cls::LOAD: return "LOAD";
     case Cls::SHIFT: return "SHIFT";
+    case Cls::COUPLED: return "COUPLED";
     case Cls::AMBIGUOUS: return "AMBIGUOUS";
     case Cls::AIR_GAIN: return "AIR_GAIN";
     case Cls::UNLOAD: return "UNLOAD";
@@ -117,6 +118,7 @@ void Core::begin(uint32_t t, const PersistBlob *r, bool sh, LogFn lf)
 {
     memset(c, 0, sizeof(c));
     now = bootAt = t;
+    lastDt = 0;
     shadow = sh;
     logFn = lf;
     st = State::INIT;
@@ -130,6 +132,18 @@ void Core::begin(uint32_t t, const PersistBlob *r, bool sh, LogFn lf)
     motionRun = abortRun = 0;
     eventOpen = false;
     eventOpenSince = t;
+    driveStartAt = steadySince = cruiseEvalAt = pulseEnd = t;
+    steady = false;
+    pulseCorner = -1;
+    for (int i = 0; i < HCS_CRUISE_MAX_PER_HOUR; i++)
+        pulseT[i] = t - 2 * HOUR_MS;
+    pulseI = 0;
+    cruiseRoll = cruisePitch = 0;
+    statsAt = t;
+    memset(stH, 0, sizeof(stH));
+    memset(stP, 0, sizeof(stP));
+    for (int i = 0; i < NC; i++)
+        sqN[i] = sqH[i] = sqH2[i] = sqP[i] = sqP2[i] = 0;
 
     needEval = true;
     lastEvalAt = t;
@@ -147,7 +161,7 @@ void Core::begin(uint32_t t, const PersistBlob *r, bool sh, LogFn lf)
     manualActive = presetPending = manualIdle = pendingManual = manualSawDrive = false;
     manualIdleSince = t;
 
-    batchStart = settleStart = 0;
+    batchStart = settleStart = batchFillMs = 0;
     batchSettling = false;
     const uint32_t old = t - 2 * HOUR_MS; // "long ago" timestamps (unsigned maths: now - old >= 2h)
     for (int i = 0; i < HCS_MAX_BATCHES_PER_HOUR; i++)
@@ -166,12 +180,21 @@ void Core::begin(uint32_t t, const PersistBlob *r, bool sh, LogFn lf)
         k.tgt = 0;
         k.pRef = NAN;
         k.pScale = NAN;
+        k.airP = k.airH = NAN;
+        k.airAt = t;
+        k.L0 = HCS_BAG_L0_DEFAULT;
+        k.l0n = 0;
+        k.fillRate = NAN;
+        k.cruiseInit = k.cruiseLow = k.cruiseRef = false;
+        k.cruiseCnt = 0;
+        k.lastPulseAt = t - 2 * HOUR_MS;
         k.floorOverride = -1;
         k.lastCorrAt = t - 2 * HOUR_MS;
         k.lastCorrDir = 0;
         k.lastCorrEpisode = 0xFFFFFFFF;
-        for (int j = 0; j < HCS_LEAK_FAULT_COUNT; j++)
-            k.leakT[j] = t - 2 * (HCS_LEAK_WINDOW_MS);
+        k.haveRefill = false;
+        k.fastCount = 0;
+        k.leakRate = NAN;
         k.goodSinceH = k.goodSinceP = t;
         k.lastSeq = 0xFFFFFFFF;
     }
@@ -206,6 +229,15 @@ void Core::begin(uint32_t t, const PersistBlob *r, bool sh, LogFn lf)
                 c[i].pRef = r->pRef[i];
                 c[i].floorOverride = finite_(r->floorOverride[i]) ? r->floorOverride[i] : -1;
                 c[i].pScale = (finite_(r->pScale[i]) && r->pScale[i] > 0 && r->pScale[i] < 250) ? r->pScale[i] : NAN;
+                bool airOk = finite_(r->airP[i]) && finite_(r->airH[i]) && r->airP[i] > 0 && r->airP[i] < 250 && r->airH[i] >= 0 &&
+                             r->airH[i] <= 100;
+                c[i].airP = airOk ? r->airP[i] : NAN;
+                c[i].airH = airOk ? r->airH[i] : NAN;
+                if (finite_(r->L0[i]) && r->L0[i] >= HCS_BAG_L0_MIN && r->L0[i] <= HCS_BAG_L0_MAX)
+                {
+                    c[i].L0 = r->L0[i];
+                    c[i].l0n = 3; // trusted, but keeps adapting
+                }
                 presetH[i] = r->presetH[i];
             }
             presetValid = r->presetValid != 0;
@@ -236,6 +268,9 @@ bool Core::exportPersist(PersistBlob &b) const
         b.pRef[i] = c[i].pRef;
         b.floorOverride[i] = c[i].floorOverride;
         b.pScale[i] = c[i].pScale;
+        b.airP[i] = c[i].airP;
+        b.airH[i] = c[i].airH;
+        b.L0[i] = c[i].L0;
     }
     for (int i = 0; i < NC; i++)
         if (c[i].tgtValid)
@@ -517,9 +552,71 @@ void Core::ingest(const Inputs &in)
     }
 }
 
+static int statBucket(float r)
+{
+    return r < 0.25f ? 0 : r < 0.5f ? 1 : r < 1.0f ? 2 : r < 2.0f ? 3 : r < 4.0f ? 4 : 5;
+}
+
+void Core::statsSample(const Inputs &in, const bool *inc)
+{
+    const int ctx = driving ? 1 : (!inEpisode ? 0 : -1); // disturbances (doors, people) are neither
+    if (ctx < 0)
+        return;
+    for (int i = 0; i < NC; i++)
+    {
+        if (!inc[i])
+            continue;
+        const Corner &k = c[i];
+        uint16_t &bh = stH[ctx][i][statBucket(k.actH / HCS_MOTION_H_THRESH)];
+        if (bh < 65535)
+            bh++;
+        if (pUsable(i))
+        {
+            uint16_t &bp = stP[ctx][i][statBucket(k.actP / HCS_MOTION_P_THRESH)];
+            if (bp < 65535)
+                bp++;
+        }
+        if (ctx == 0 && finite_(in.c[i].h) && finite_(in.c[i].p))
+        {
+            sqN[i] += 1;
+            sqH[i] += in.c[i].h;
+            sqH2[i] += (double)in.c[i].h * in.c[i].h;
+            sqP[i] += in.c[i].p;
+            sqP2[i] += (double)in.c[i].p * in.c[i].p;
+        }
+    }
+}
+
+void Core::statsFlush()
+{
+    static const char *const CTX[2] = {"QUIET", "DRIVE"};
+    for (int ctx = 0; ctx < 2; ctx++)
+        for (int i = 0; i < NC; i++)
+        {
+            const uint16_t *a = stH[ctx][i], *b = stP[ctx][i];
+            uint32_t n = 0;
+            for (int j = 0; j < 6; j++)
+                n += a[j];
+            if (n == 0)
+                continue;
+            char sd[48] = "";
+            if (ctx == 0 && sqN[i] > 10)
+            {
+                double mh = sqH[i] / sqN[i], mp = sqP[i] / sqN[i];
+                double vh = sqH2[i] / sqN[i] - mh * mh, vp = sqP2[i] / sqN[i] - mp * mp;
+                snprintf(sd, sizeof(sd), " sdH=%.3f sdP=%.2f", sqrt(vh > 0 ? vh : 0), sqrt(vp > 0 ? vp : 0));
+            }
+            logf("STATS %s %s H/th[%u %u %u %u %u %u] P/th[%u %u %u %u %u %u]%s", CTX[ctx], CN[i], a[0], a[1], a[2], a[3], a[4], a[5],
+                 b[0], b[1], b[2], b[3], b[4], b[5], sd);
+        }
+    memset(stH, 0, sizeof(stH));
+    memset(stP, 0, sizeof(stP));
+    for (int i = 0; i < NC; i++)
+        sqN[i] = sqH[i] = sqH2[i] = sqP[i] = sqP2[i] = 0;
+}
+
 void Core::motionDetect(const Inputs &in, uint32_t dt)
 {
-    (void)in;
     int included = 0, voting = 0, strong = 0;
     bool vote[NC] = {false, false, false, false};
     bool inc[NC] = {false, false, false, false};
@@ -542,6 +639,12 @@ void Core::motionDetect(const Inputs &in, uint32_t dt)
     lastIncluded = included;
     lastVoting = voting;
     lastStrong = strong;
+    statsSample(in, inc);
+    if ((now - statsAt) >= HCS_STATS_PERIOD_MS)
+    {
+        statsAt = now;
+        statsFlush();
+    }
 
     if (included < HCS_MOTION_MIN_CORNERS)
     {
@@ -570,6 +673,12 @@ void Core::motionDetect(const Inputs &in, uint32_t dt)
         {
             driving = true;
             armedAfterDrive = true;
+            driveStartAt = episodeStart;
+            for (int i = 0; i < NC; i++)
+            {
+                c[i].cruiseInit = c[i].cruiseLow = c[i].cruiseRef = false;
+                c[i].cruiseCnt = 0;
+            }
             logf("DRIVING confirmed (motion for %lus) -> all autonomous actuation vetoed; re-baseline on arrival",
                  (unsigned long)((now - episodeStart) / 1000));
         }
@@ -626,6 +735,7 @@ void Core::tick(const Inputs &in, Outputs &out)
 {
     uint32_t dt = in.now - now;
     now = in.now;
+    lastDt = dt;
     memset(&out, 0, sizeof(out));
 
     ingest(in);
@@ -640,6 +750,12 @@ void Core::tick(const Inputs &in, Outputs &out)
     }
 
     motionDetect(in, dt);
+    if (pulseCorner >= 0 || driving)
+    {
+        cruiseTick(in, out);
+        if (out.cmd != Cmd::NONE)
+            return; // one command per tick
+    }
     tickInner(in, out);
 
     if (dirty && (persistImmediate || (now - lastPersistAt) >= HCS_PERSIST_MIN_INTERVAL_MS))
@@ -679,11 +795,16 @@ void Core::tickInner(const Inputs &in, Outputs &out)
     // ---- user / legacy actuation always wins
     bool userActivity = pendingManual;
     const char *why = pendingManual ? (presetPending ? "preset load" : "manual command") : "valve activity";
+    if (pendingManual && pulseCorner >= 0)
+    {
+        logf("CRUISE pulse %s released: user command", CN[pulseCorner]);
+        pulseCorner = -1; // the adapter already handed the solenoids to the user
+    }
     pendingManual = false;
     for (int i = 0; i < NC; i++)
     {
         const CornerIn &x = in.c[i];
-        bool mine = (st == State::CORRECTING) && c[i].inBatch;
+        bool mine = ((st == State::CORRECTING) && c[i].inBatch) || (i == pulseCorner);
         if (x.routineActive && !x.routineAutonomous)
         {
             userActivity = true;
@@ -807,6 +928,8 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
         c[i].tgt = fminf_(hm[i], ch);
         c[i].pRef = pOk[i] ? pm[i] : NAN;
         c[i].pScale = c[i].pRef;
+        if (pOk[i])
+            setAirRef(i, pm[i], hm[i]);
         c[i].tgtValid = true;
         logf("BASELINE %s init tgt=%.1f pRef=%.1f", CN[i], c[i].tgt, c[i].pRef);
         markPersist(false);
@@ -868,6 +991,58 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
     else
         logf("EVAL %s load=%+.1f%% (%s, n=%d) tank=%.0f pres=%d", kind, loadFrac * 100.0f, GN[g], nl, tank, in.presence ? 1 : 0);
 
+    // ---- learn each bag's volume offset L0 from load-only changes (door / person / cargo events): air is
+    // constant, so p1 (h1 + L0) = p2 (h2 + L0)  ->  L0 = (p2 h2 - p1 h1) / (p1 - p2).
+    if (strcmp(kind, "EVENT") == 0)
+    {
+        for (int i = 0; i < NC; i++)
+        {
+            Corner &k = c[i];
+            if (!hOk[i] || !pOk[i] || !finite_(k.airP) || (now - k.airAt) > 1800000UL)
+                continue;
+            float dP = pm[i] - k.airP, dH = hm[i] - k.airH;
+            if (fabsf(dP) < 4.0f || fabsf(dH) < 1.5f || dP * dH >= 0)
+                continue; // not a clean load change (compression must raise pressure)
+            float est = (pm[i] * hm[i] - k.airP * k.airH) / (k.airP - pm[i]);
+            if (!finite_(est))
+                continue;
+            est = fminf_(fmaxf_(est, HCS_BAG_L0_MIN), HCS_BAG_L0_MAX);
+            float old = k.L0;
+            k.L0 = k.l0n == 0 ? est : 0.75f * k.L0 + 0.25f * est;
+            k.l0n++;
+            markPersist(false);
+            logf("L0 %s learned %.1f (sample %.1f, n=%d, was %.1f) from dp=%+.1f dh=%+.1f", CN[i], k.L0, est, k.l0n, old, dP, dH);
+        }
+    }
+
+    // ---- did each bag's AIR change since it was last known-good?
+    //  sign test (no L0 needed): unchanged air => dp and dh have opposite signs. Primary.
+    //  magnitude test: a = p (h + L0) changed > HCS_AIR_FRAC. Only once L0 is learned for that corner.
+    float daA[NC];
+    int8_t airChg[NC]; // -1 lost air, +1 gained air, 0 no evidence
+    int nLoss = 0, nGain = 0;
+    for (int i = 0; i < NC; i++)
+    {
+        airChg[i] = 0;
+        daA[i] = NAN;
+        if (!hOk[i] || !pOk[i] || !finite_(c[i].airP))
+            continue;
+        daA[i] = airDelta(i, pm[i], hm[i]);
+        const float dH = hm[i] - c[i].airH, dP = pm[i] - c[i].airP;
+        if (dH < -HCS_AIR_SIGN_DH && dP <= HCS_PRESSURE_NOISE_PSI)
+            airChg[i] = -1;
+        else if (dH > HCS_AIR_SIGN_DH && dP >= -HCS_PRESSURE_NOISE_PSI)
+            airChg[i] = +1;
+        else if (c[i].l0n >= HCS_L0_TRUST_SAMPLES && finite_(daA[i]))
+            airChg[i] = daA[i] < -HCS_AIR_FRAC ? -1 : (daA[i] > HCS_AIR_FRAC ? +1 : 0);
+        if (airChg[i] < 0)
+            nLoss++;
+        if (airChg[i] > 0)
+            nGain++;
+    }
+    // Temperature moves (nearly) all bags together: that is not "another bag's event" for the COUPLED rule.
+    const bool commonLoss = nLoss >= 3, commonGain = nGain >= 3;
+
     // ---- per-corner classification
     Cls cls[NC];
     int8_t dir[NC];
@@ -888,6 +1063,12 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
         const float e = hm[i] - k.tgt;
         const bool pv = pOk[i] && finite_(k.pRef);
         const float dp = pv ? pm[i] - k.pRef : 0;
+        const float da = daA[i];
+        const bool av = finite_(c[i].airP);
+        bool airEventElsewhere = false; // another bag's air changed (not the all-bags thermal mode)
+        for (int j = 0; j < NC; j++)
+            if (j != i && ((airChg[j] < 0 && !commonLoss) || (airChg[j] > 0 && !commonGain)))
+                airEventElsewhere = true;
         const float ft = floorTrigger(in, i);
         const float lt = liftTarget(in, i);
         const float oldTgt = k.tgt;
@@ -926,16 +1107,18 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
             // when no event is open)
             rerefWithin[i] = pOk[i] && fabsf(e) <= 0.5f * HCS_DEADBAND_H;
         }
-        else if (!pv)
+        else if (!pv || !av)
         {
-            // No pressure reference (fresh preset commit across a drive, pressure sensor fault...). Cannot tell
-            // terrain from air loss -> fail-safe: accept the geometry, never pump.
+            // No pressure / air reference (fresh preset commit across a drive, pressure sensor fault...). Cannot
+            // tell terrain from air loss -> fail-safe: accept the geometry, never pump.
             cls[i] = pOk[i] ? Cls::SHIFT : Cls::AMBIGUOUS;
         }
         else if (e < 0)
         {
-            if (dp <= HCS_PRESSURE_NOISE_PSI)
-                cls[i] = Cls::AIR_LOSS; // compression always raises bag pressure; this did not -> less air
+            if (airChg[i] < 0)
+                cls[i] = Cls::AIR_LOSS; // this bag holds less air than when it was right: leak / cooling
+            else if (airEventElsewhere)
+                cls[i] = Cls::COUPLED; // body tilted because another bag gained / lost air: hold, never accept
             else if (g == G_UP)
                 cls[i] = Cls::LOAD;
             else if (g == G_NEUTRAL)
@@ -947,8 +1130,10 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
         }
         else
         {
-            if (dp >= -HCS_PRESSURE_NOISE_PSI)
+            if (airChg[i] > 0)
                 cls[i] = Cls::AIR_GAIN; // thermal expansion: hold, it reverses itself when the bag cools
+            else if (airEventElsewhere)
+                cls[i] = Cls::COUPLED;
             else if (g == G_DOWN)
                 cls[i] = Cls::UNLOAD;
             else if (g == G_NEUTRAL)
@@ -969,7 +1154,10 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
                 nt = presetH[i]; // came back to (near) flat ground: re-anchor on the preset
             k.tgt = nt;
             if (pOk[i])
+            {
                 k.pRef = pm[i];
+                setAirRef(i, pm[i], hm[i]); // air unchanged by definition; re-anchoring removes L0-error drift
+            }
             markPersist(false);
         }
         else if (arrival && presetValid && cls[i] != Cls::FROZEN && cls[i] != Cls::AMBIGUOUS && cls[i] != Cls::BOTTOM_GUARD &&
@@ -995,8 +1183,8 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
             if (periodicEval && cls[i] == k.lastCls)
                 logq("  %s %s (unchanged)", CN[i], clsName(cls[i]));
             else
-                logf("  %s %s h=%.1f tgt=%.1f->%.1f e=%+.1f dp=%+.1f%s", CN[i], clsName(cls[i]), hm[i], oldTgt, k.tgt, e, dp,
-                     pv ? "" : " (no pRef)");
+                logf("  %s %s h=%.1f tgt=%.1f->%.1f e=%+.1f dp=%+.1f air=%+.1f%%%s", CN[i], clsName(cls[i]), hm[i], oldTgt, k.tgt, e,
+                     dp, finite_(da) ? da * 100.0f : 0.0f, (pv && av) ? "" : " (no ref)");
         }
         k.lastCls = cls[i];
     }
@@ -1128,23 +1316,7 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
         if (wasCompletion)
             k.completeDir = -2; // marker: this batch IS the completion; finalize must not schedule another
         if (dir[i] > 0 && !wasCompletion && (cls[i] == Cls::AIR_LOSS || cls[i] == Cls::BOTTOM_GUARD))
-        {
-            for (int j = HCS_LEAK_FAULT_COUNT - 1; j > 0; j--)
-                k.leakT[j] = k.leakT[j - 1];
-            k.leakT[0] = now;
-            int n = 0;
-            for (int j = 0; j < HCS_LEAK_FAULT_COUNT; j++)
-                if ((now - k.leakT[j]) < HCS_LEAK_WINDOW_MS)
-                    n++;
-            if (k.leakAllowance)
-                k.leakAllowance = false;
-            else if (n >= HCS_LEAK_FAULT_COUNT && !k.leakFault)
-            {
-                k.leakFault = true;
-                logf("LEAK %s: %d refills inside %luh -> latched; no further autonomous refills of this corner (check the bag/lines)",
-                     CN[i], n, (unsigned long)(HCS_LEAK_WINDOW_MS / HOUR_MS));
-            }
-        }
+            recordRefill(i, goal[i] - hm[i]);
     }
 
     if (shadow)
@@ -1174,6 +1346,7 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
         k.batchCls = cls[i];
         k.batchH0 = hm[i];
         k.batchP0 = pOk[i] ? pm[i] : NAN;
+        k.batchOpenMs = 0;
         k.valveOpenSince = now;
     }
     for (int i = 0; i < NC; i++)
@@ -1185,6 +1358,284 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
     st = State::CORRECTING;
     logf("START %s %s(batch %d/h, fill %lus/h used)", dir[best] > 0 ? "fill" : "dump", what, batchesLastHour(),
          (unsigned long)(fillMsLastHour() / 1000));
+}
+
+void Core::setAirRef(int i, float pp, float hh)
+{
+    c[i].airP = pp;
+    c[i].airH = hh;
+    c[i].airAt = now;
+}
+
+float Core::airDelta(int i, float pp, float hh) const
+{
+    const Corner &k = c[i];
+    if (!finite_(k.airP) || !finite_(k.airH) || !finite_(pp) || !finite_(hh))
+        return NAN;
+    float ref = k.airP * (k.airH + k.L0);
+    if (ref < 1.0f)
+        return NAN;
+    return pp * (hh + k.L0) / ref - 1.0f;
+}
+
+// Leak bookkeeping for one AIR_LOSS / BOTTOM_GUARD refill (or a cruise top-up) of `deficit` height %.
+void Core::recordRefill(int i, float deficit)
+{
+    Corner &k = c[i];
+    if (k.haveRefill)
+    {
+        uint32_t iv = now - k.lastRefillAt;
+        float hrs = iv / 3600000.0f;
+        float rate = hrs > 0.01f ? deficit / hrs : NAN;
+        if (finite_(rate))
+            k.leakRate = finite_(k.leakRate) ? 0.7f * k.leakRate + 0.3f * rate : rate;
+        k.fastCount = (iv < HCS_LEAK_FAST_INTERVAL_MS) ? k.fastCount + 1 : 0;
+        logf("LEAK %s refill: %.1f%% after %.1fh (~%.2f %%/h, smoothed %.2f %%/h)%s", CN[i], deficit, hrs, rate, k.leakRate,
+             k.fastCount ? " FAST" : "");
+    }
+    k.haveRefill = true;
+    k.lastRefillAt = now;
+    if (k.leakAllowance)
+        k.leakAllowance = false;
+    else if (k.fastCount >= HCS_LEAK_FAST_COUNT && !k.leakFault)
+    {
+        k.leakFault = true;
+        logf("LEAK %s: %d consecutive refills < %lumin apart -> FAST leak latched; no further autonomous refills of this "
+             "corner until a BLE client reconnects / a preset is loaded (check the bag and fittings)",
+             CN[i], k.fastCount + 1, (unsigned long)(HCS_LEAK_FAST_INTERVAL_MS / 60000UL));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Cruise top-up (slow leak while driving)
+// ---------------------------------------------------------------------------------------------------------
+
+void Core::cruiseTick(const Inputs &in, Outputs &out)
+{
+    // ---- 2-minute (leak) and 1-second (roll / pitch excursion) averages per corner
+    const float aL = (float)HCS_TICK_MS / (float)HCS_CRUISE_TAU_MS;
+    const float aS = 0.1f;
+    bool allInit = true;
+    for (int i = 0; i < NC; i++)
+    {
+        Corner &k = c[i];
+        const CornerIn &x = in.c[i];
+        if (k.hFault || k.pFault)
+        {
+            allInit = false;
+            continue;
+        }
+        if (k.busy || (now - k.idleSince) < HCS_P_SETTLE_MS)
+        {
+            if (!k.cruiseInit)
+                allInit = false;
+            continue; // our own pulse: flow-affected readings
+        }
+        if (!k.cruiseInit)
+        {
+            k.hL = k.hS = x.h;
+            k.pL = x.p;
+            k.cruiseInit = true;
+        }
+        else
+        {
+            k.hL += aL * (x.h - k.hL);
+            k.pL += aL * (x.p - k.pL);
+            k.hS += aS * (x.h - k.hS);
+        }
+    }
+    bool st_ = false;
+    if (allInit)
+    {
+        float d[NC];
+        for (int i = 0; i < NC; i++)
+            d[i] = c[i].hS - c[i].hL;
+        cruiseRoll = 0.5f * ((d[C_FP] + d[C_RP]) - (d[C_FD] + d[C_RD]));
+        cruisePitch = 0.5f * ((d[C_FP] + d[C_FD]) - (d[C_RP] + d[C_RD]));
+        st_ = fabsf(cruiseRoll) < HCS_CRUISE_STEADY_DEV && fabsf(cruisePitch) < HCS_CRUISE_STEADY_DEV;
+    }
+    if (st_ && !steady)
+        steadySince = now;
+    steady = st_;
+
+    // ---- a pulse in flight: end it on time, or the moment anything is not right
+    if (pulseCorner >= 0)
+    {
+        const char *why = nullptr;
+        if (!in.presence)
+            why = "BLE presence lost";
+        else if (!in.enabled || in.safetyMode)
+            why = "supervisor disabled";
+        else if (!steady)
+            why = "roll / pitch excursion";
+        else if (c[pulseCorner].hFault || c[pulseCorner].pFault || mappingFault)
+            why = "fault";
+        bool timeUp = (int32_t)(now - pulseEnd) >= 0;
+        if (why || timeUp)
+        {
+            out.cmd = Cmd::ABORT;
+            out.g[pulseCorner].active = true;
+            if (why)
+                logf("CRUISE pulse %s cut short: %s", CN[pulseCorner], why);
+            pulseCorner = -1;
+        }
+        return;
+    }
+
+    if (!HCS_CRUISE_TOPUP || !driving || (now - driveStartAt) < HCS_CRUISE_MIN_DRIVE_MS || (now - cruiseEvalAt) < 10000UL)
+        return;
+    cruiseEvalAt = now;
+    for (int i = 0; i < NC; i++)
+        if (!c[i].cruiseRef && c[i].cruiseInit)
+        {
+            c[i].hC = c[i].hL;
+            c[i].pC = c[i].pL;
+            c[i].cruiseRef = true;
+        }
+    if (!presetValid || !allInit || mappingFault || externalFreeze || heightFaultCount() > 0 || !in.enabled || in.safetyMode)
+        return;
+
+    // ---- leak signature on the 2-min averages (see hcs_config.h HCS_CRUISE_WARP for the physics)
+    static const int DIAG[NC] = {C_RD, C_FD, C_RP, C_FP}; // FP<->RD, RP<->FD
+    float fr[NC];
+    for (int i = 0; i < NC; i++)
+    {
+        float sc = finite_(c[i].pScale) ? c[i].pScale : 100.0f;
+        fr[i] = c[i].pL / fmaxf_(sc, HCS_PREF_MIN_PSI) - 1.0f;
+    }
+    const float warp = 0.25f * (fr[C_FP] + fr[C_RD] - fr[C_FD] - fr[C_RP]);
+    bool airMode = true;
+    float da[NC], srt[NC];
+    for (int i = 0; i < NC; i++)
+    {
+        da[i] = airDelta(i, c[i].pL, c[i].hL);
+        if (c[i].l0n < HCS_L0_TRUST_SAMPLES || !finite_(da[i]))
+            airMode = false;
+        srt[i] = da[i];
+    }
+    float mDa = 0;
+    if (airMode)
+    {
+        for (int a = 1; a < NC; a++)
+            for (int b = a; b > 0 && srt[b] < srt[b - 1]; b--)
+            {
+                float t1 = srt[b];
+                srt[b] = srt[b - 1];
+                srt[b - 1] = t1;
+            }
+        mDa = 0.5f * (srt[1] + srt[2]);
+    }
+
+    int best = -1;
+    float bestScore = 0;
+    for (int i = 0; i < NC; i++)
+    {
+        Corner &k = c[i];
+        const int dg = DIAG[i];
+        float score; // how strongly this bag looks like it lost air (positive = yes)
+        bool low;
+        // hysteresis: enter at the full threshold, stay while above half of it (the 2-min averages still carry
+        // some of the road's corner / brake rhythm)
+        const float hy = k.cruiseLow ? 0.5f : 1.0f;
+        if (airMode)
+        {
+            score = -(da[i] - mDa);
+            low = score > hy * HCS_CRUISE_AIR_FRAC;
+        }
+        else
+        {
+            const float hw = 0.5f * HCS_CRUISE_WARP * hy;
+            bool pairUnloaded = (i == C_FP || i == C_RD) ? warp < -hw : warp > hw;
+            const float dH = k.hL - k.hC, dP = k.pL - k.pC;
+            const float dHd = c[dg].hL - c[dg].hC;
+            score = -dH;
+            // this bag: down without a pressure rise; its diagonal partner: not down with it (else it is heave)
+            low = k.cruiseRef && pairUnloaded && dH < -hy * HCS_CRUISE_SIGN_DH && dP <= 0.5f + (1 - hy) &&
+                  dHd > dH + hy * HCS_CRUISE_SIGN_DH;
+        }
+        low = low && k.floorOverride < 0 && presetH[i] >= floorBase(in, i);
+        const int need = (int)(HCS_CRUISE_PERSIST_MS / 10000UL);
+        k.cruiseCnt = low ? (k.cruiseCnt < 2 * need ? k.cruiseCnt + 1 : k.cruiseCnt) : (k.cruiseCnt > 0 ? k.cruiseCnt - 1 : 0);
+        if (low && !k.cruiseLow)
+        {
+            k.cruiseLow = true;
+            k.cruiseLowSince = now;
+            if (k.cruiseCnt == 1)
+            logf("CRUISE %s looks like it is losing air (%s: air %.1f%% | warp %+.1f%%, trip dh %+.1f dp %+.1f) -> watching", CN[i],
+                 airMode ? "air index" : "warp + sign", airMode ? -score * 100.0f : 0.0f, warp * 100.0f, k.hL - k.hC, k.pL - k.pC);
+        }
+        else if (k.cruiseCnt == 0 && k.cruiseLow)
+            k.cruiseLow = false;
+        if (k.cruiseLow && k.cruiseCnt >= need && score > bestScore)
+        {
+            best = i;
+            bestScore = score;
+        }
+    }
+    if (best < 0)
+        return;
+    const float bestRel = -HCS_CRUISE_STEP; // fixed, small step per pulse; repeated (with dwell) if still needed
+
+    Corner &k = c[best];
+    const char *no = nullptr;
+    int nh = 0;
+    for (int j = 0; j < HCS_CRUISE_MAX_PER_HOUR; j++)
+        if ((now - pulseT[j]) < HOUR_MS)
+            nh++;
+    const float step = fminf_(-bestRel, HCS_CRUISE_STEP);
+    if (!in.presence)
+        no = "no BLE client";
+    else if (!steady || (now - steadySince) < HCS_CRUISE_STEADY_MS)
+        no = "not steady long enough";
+    else if ((now - k.lastPulseAt) < HCS_CRUISE_DWELL_MS)
+        no = "dwell";
+    else if (nh >= HCS_CRUISE_MAX_PER_HOUR)
+        no = "hourly cruise budget";
+    else if (k.leakFault && !k.leakAllowance)
+        no = "leak fault latched";
+    else if (!tankValid || tank < k.pL + HCS_TANK_HEADROOM_PSI)
+        no = "waiting for tank headroom";
+    else if (k.pL >= in.bagCeilPsi - HCS_BAG_P_MARGIN)
+        no = "bag pressure ceiling";
+    else if (k.hL + step > ceilH())
+        no = "ceiling";
+    if (no)
+    {
+        logq("CRUISE %s top-up refused: %s", CN[best], no);
+        return;
+    }
+    // Pulse length from the fill rate measured on parked fills (x0.7 safety), else a short fixed pulse.
+    uint32_t ms = finite_(k.fillRate) && k.fillRate > 0.1f ? (uint32_t)(0.7f * step / k.fillRate * 1000.0f) : HCS_CRUISE_PULSE_DEFAULT_MS;
+    if (ms < 100)
+        ms = 100;
+    if (ms > HCS_CRUISE_PULSE_MAX_MS)
+        ms = HCS_CRUISE_PULSE_MAX_MS;
+
+    k.lastPulseAt = now;
+    k.cruiseLow = false;
+    k.cruiseCnt = 0;
+    pulseT[pulseI] = now;
+    pulseI = (pulseI + 1) % HCS_CRUISE_MAX_PER_HOUR;
+    recordRefill(best, step);
+    if (shadow)
+    {
+        logf("SHADOW would CRUISE top-up %s: %lu ms (~%.1f%%)", CN[best], (unsigned long)ms, step);
+        return;
+    }
+    out.cmd = Cmd::PULSE;
+    out.g[best].active = true;
+    out.g[best].dir = +1;
+    out.g[best].pulseMs = (uint16_t)ms;
+    out.g[best].ceilH = ceilH() + 1.0f;
+    out.g[best].ceilP = in.bagCeilPsi - HCS_BAG_P_MARGIN;
+    pulseCorner = best;
+    pulseEnd = now + ms;
+    fillT[fillI] = now;
+    fillMs[fillI] = ms;
+    fillI = (fillI + 1) % 16;
+    logf("CRUISE top-up %s (%s): losing air for %lus, steady %lus -> fill pulse %lu ms (~%.1f%%, rate %s)", CN[best],
+         airMode ? "air index" : "warp + sign", (unsigned long)((now - k.cruiseLowSince) / 1000),
+         (unsigned long)((now - steadySince) / 1000), (unsigned long)ms, step, finite_(k.fillRate) ? "learned" : "default");
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1261,8 +1712,12 @@ void Core::tickCorrecting(const Inputs &in, Outputs &out)
 
     bool running = false;
     for (int i = 0; i < NC; i++)
+    {
         if (c[i].inBatch && (in.c[i].routineActive || in.c[i].inOpen || in.c[i].outOpen))
             running = true;
+        if (c[i].inBatch && in.c[i].inOpen)
+            c[i].batchOpenMs += lastDt;
+    }
     if (running)
         return;
     if (!batchSettling)
@@ -1276,6 +1731,7 @@ void Core::tickCorrecting(const Inputs &in, Outputs &out)
         fillT[fillI] = now;
         fillMs[fillI] = up ? (now - batchStart) : 0;
         fillI = (fillI + 1) % 16;
+        batchFillMs = now - batchStart;
         return;
     }
     if ((now - settleStart) < HCS_POST_CORRECTION_SETTLE_MS)
@@ -1288,7 +1744,10 @@ void Core::finalizeBatch(const Inputs &in)
     (void)in;
     // Mapping check: the corner we actuated must be the one whose height moved the most.
     {
-        float maxOther = 0, minBatch = 1e9f;
+        // Compare against the MOST-moved actuated corner: a correctly wired batch always moves its own corner
+        // most; neighbours follow through the body / anti-roll bar by a fraction of that. (Using the least-moved
+        // batch corner falsely tripped on axle batches where one corner was already near its target.)
+        float maxOther = 0, maxBatch = 0;
         int other = -1, bc = -1;
         for (int i = 0; i < NC; i++)
         {
@@ -1299,9 +1758,9 @@ void Core::finalizeBatch(const Inputs &in)
             float d = fabsf(hm - batchAllH0[i]);
             if (c[i].inBatch)
             {
-                if (d < minBatch)
+                if (bc < 0 || d > maxBatch)
                 {
-                    minBatch = d;
+                    maxBatch = d;
                     bc = i;
                 }
             }
@@ -1311,12 +1770,12 @@ void Core::finalizeBatch(const Inputs &in)
                 other = i;
             }
         }
-        if (bc >= 0 && other >= 0 && maxOther >= HCS_MAPPING_MIN_DH && maxOther > HCS_MAPPING_RATIO * minBatch)
+        if (bc >= 0 && other >= 0 && maxOther >= HCS_MAPPING_MIN_DH && maxOther > HCS_MAPPING_RATIO * maxBatch)
         {
             mappingFault = true;
             logf("FAULT MAPPING: actuated %s moved %.1f%% but %s moved %.1f%% -> valve/height/pressure corner wiring "
                  "mismatch suspected; ALL autonomous actuation frozen until reboot",
-                 CN[bc], minBatch, CN[other], maxOther);
+                 CN[bc], maxBatch, CN[other], maxOther);
         }
     }
     for (int i = 0; i < NC; i++)
@@ -1334,6 +1793,12 @@ void Core::finalizeBatch(const Inputs &in)
         }
         float dh = hm - k.batchH0;
         float dpp = (pOk && finite_(k.batchP0)) ? pm - k.batchP0 : 0;
+        if (k.batchDir > 0 && dh > 1.0f && k.batchOpenMs >= 300)
+        {
+            float r = dh / (k.batchOpenMs / 1000.0f); // height % per second the IN valve was actually open
+            k.fillRate = finite_(k.fillRate) ? 0.7f * k.fillRate + 0.3f * r : r;
+            logf("  %s fill rate %.2f %%/s (valve open %lu ms)", CN[i], k.fillRate, (unsigned long)k.batchOpenMs);
+        }
         logf("RESULT %s %s %+d: h %.1f->%.1f (tgt %.1f, e=%+.1f) p %+.1f", CN[i], clsName(k.batchCls), k.batchDir, k.batchH0, hm, k.tgt,
              hm - k.tgt, dpp);
         float short_ = (k.batchDir > 0) ? (k.tgt - hm) : (hm - k.tgt);
@@ -1355,6 +1820,9 @@ void Core::finalizeBatch(const Inputs &in)
         // pRef deliberately NOT updated here: a fill at constant load leaves bag pressure where it was, and the
         // event's evidence (e.g. the total-load rise) must survive until every affected corner is resolved.
         // The WITHIN rule re-references once the event closes.
+        // The AIR reference does follow: we changed this bag's air on purpose.
+        if (pOk)
+            setAirRef(i, pm, hm);
     }
     batchSettling = false;
     st = mappingFault ? State::FAULT : State::PARKED;
@@ -1432,9 +1900,13 @@ void Core::tickManual(const Inputs &in)
         // The pressure reference is only meaningful if the car has not driven since the user's command.
         k.pRef = (pOk[i] && !manualSawDrive) ? pm[i] : NAN;
         if (pOk[i])
-            k.pScale = pm[i]; // magnitude only: fine even across a drive
+        {
+            k.pScale = pm[i];          // magnitude only: fine even across a drive
+            setAirRef(i, pm[i], hm[i]); // air content is valid across a drive (only load evidence is not)
+        }
         k.tgtValid = true;
         k.leakFault = k.leakAllowance = false;
+        k.fastCount = 0;
         k.hFault &= ~HF_NO_RESPONSE;
         logf("COMMIT %s %s tgt=%.1f pRef=%.1f%s", CN[i], presetPending ? "preset" : "manual", k.tgt, k.pRef,
              k.floorOverride >= 0 ? " (user-held below min ride)" : "");

@@ -70,6 +70,14 @@
 #ifndef HCS_MOTION_MIN_CORNERS
 #define HCS_MOTION_MIN_CORNERS 2
 #endif
+// Field statistics for tuning the two thresholds above (one STATS line per corner and context every period):
+// histogram of the detector's activity metric in multiples of its threshold, buckets
+// [<.25 | .25-.5 | .5-1 | 1-2 | 2-4 | >4] x threshold, for QUIET (parked, no motion episode) and DRIVE, plus the
+// parked standard deviation of height and pressure. Target: QUIET mass in the first two buckets, DRIVE above 1.
+#ifndef HCS_STATS_PERIOD_MS
+#define HCS_STATS_PERIOD_MS 600000UL
+#endif
+
 // Consecutive motion ticks needed to START an episode (single-sample noise spikes are not motion).
 #ifndef HCS_MOTION_START_TICKS
 #define HCS_MOTION_START_TICKS 3
@@ -124,9 +132,36 @@
 #ifndef HCS_DEADBAND_H
 #define HCS_DEADBAND_H 3.0f
 #endif
-// Per-corner pressure noise for the sign test (did this corner's bag pressure really go up / down?).
+// Per-corner pressure noise (used for the pressure-reference bookkeeping and logs).
 #ifndef HCS_PRESSURE_NOISE_PSI
 #define HCS_PRESSURE_NOISE_PSI 1.5f
+#endif
+// AIR CONTENT index of a bag: air ~ p * V, V ~ (h + L0)  ->  a = p * (h + L0).
+// Load, terrain, cornering, braking and a NEIGHBOUR's leak or fill change a bag's p and h but not its air mass;
+// only a leak, temperature or our own valves do. A corner whose air index fell by more than HCS_AIR_FRAC lost air.
+// L0 = bag volume at h = 0 expressed in height-% units. Unknown for a given bag -> learned per corner from load
+// events (people in/out: air constant, p and h change) and logged; this is the starting value.
+#ifndef HCS_BAG_L0_DEFAULT
+#define HCS_BAG_L0_DEFAULT 30.0f
+#endif
+#ifndef HCS_BAG_L0_MIN
+#define HCS_BAG_L0_MIN 2.0f
+#endif
+#ifndef HCS_BAG_L0_MAX
+#define HCS_BAG_L0_MAX 150.0f
+#endif
+#ifndef HCS_AIR_FRAC
+#define HCS_AIR_FRAC 0.03f
+#endif
+// The magnitude test above needs a trustworthy L0; until a corner has this many learned samples only the
+// L0-free SIGN test is used: a bag with unchanged air moves along its own p(h) curve, so dp and dh always
+// have opposite signs. Down without a pressure rise (or up without a pressure drop) = its air changed.
+#ifndef HCS_L0_TRUST_SAMPLES
+#define HCS_L0_TRUST_SAMPLES 3
+#endif
+// Height change (vs the air reference) needed before the sign test says anything.
+#ifndef HCS_AIR_SIGN_DH
+#define HCS_AIR_SIGN_DH 1.5f
 #endif
 // Total-load test: mean over corners of (dp / pRef). Load is redistributed by slopes, crowns, cornering and
 // braking (mean ~0) but changed by people / cargo (mean != 0). Fraction, i.e. 0.015 = 1.5 % of vehicle load.
@@ -152,6 +187,63 @@
 // preset (anchor; stops the reference random-walking away from the preset over many trips).
 #ifndef HCS_ANCHOR_TOL
 #define HCS_ANCHOR_TOL 3.0f
+#endif
+
+// ---------------------------------------------------------------------------------------------------------
+// Cruise top-up: slow-leak compensation WHILE DRIVING (long road trips). A separate, deliberately weaker path:
+// open-loop, fill-only, single-corner pulses, decided on 2-minute averages (cornering / braking / bumps
+// average out; a leak does not), only during steady driving, aborted on any roll / pitch excursion.
+// ---------------------------------------------------------------------------------------------------------
+#ifndef HCS_CRUISE_TOPUP
+#define HCS_CRUISE_TOPUP true
+#endif
+#ifndef HCS_CRUISE_TAU_MS
+#define HCS_CRUISE_TAU_MS 120000UL // long-average time constant
+#endif
+#ifndef HCS_CRUISE_MIN_DRIVE_MS
+#define HCS_CRUISE_MIN_DRIVE_MS 600000UL // driving at least 10 min (averages settled, bags warm)
+#endif
+// Leak signal while driving, on the 2-minute averages. On a rigid body one bag losing air does NOT make one corner
+// low (the four lengths stay coplanar on a road); it tilts the body toward that corner and puts a LOAD WARP on the
+// car: that bag and its diagonal partner unload, the other diagonal loads up. Cornering / braking (moments), people
+// (point loads) and road camber (planar) produce ~no warp, and road-surface warp averages out over 2 min.
+//  - air-index mode (all four L0 learned): bag air content vs its reference, differential vs the median bag.
+//  - warp mode (L0-free fallback): load warp says which diagonal unloaded (> HCS_CRUISE_WARP / 2) and the sign test
+//    below (vs the trip reference) says which bag of that diagonal lost air.
+#ifndef HCS_CRUISE_AIR_FRAC
+#define HCS_CRUISE_AIR_FRAC 0.04f
+#endif
+#ifndef HCS_CRUISE_WARP
+#define HCS_CRUISE_WARP 0.012f
+#endif
+// Leaker identification (L0-free): versus a trip reference taken from the 2-min averages at minute 10, the bag
+// losing air goes DOWN while its pressure does NOT rise (its diagonal partner also unloads but goes UP).
+#ifndef HCS_CRUISE_SIGN_DH
+#define HCS_CRUISE_SIGN_DH 1.5f
+#endif
+#ifndef HCS_CRUISE_PERSIST_MS
+#define HCS_CRUISE_PERSIST_MS 300000UL // ...continuously for 5 min
+#endif
+#ifndef HCS_CRUISE_STEADY_DEV
+#define HCS_CRUISE_STEADY_DEV 2.0f // 1 s roll / pitch deviation from the 2 min mean that still counts as steady
+#endif
+#ifndef HCS_CRUISE_STEADY_MS
+#define HCS_CRUISE_STEADY_MS 20000UL
+#endif
+#ifndef HCS_CRUISE_STEP
+#define HCS_CRUISE_STEP 2.0f // max height % added per pulse
+#endif
+#ifndef HCS_CRUISE_PULSE_MAX_MS
+#define HCS_CRUISE_PULSE_MAX_MS 1500
+#endif
+#ifndef HCS_CRUISE_PULSE_DEFAULT_MS
+#define HCS_CRUISE_PULSE_DEFAULT_MS 400 // until this corner's fill rate has been learned from parked fills
+#endif
+#ifndef HCS_CRUISE_DWELL_MS
+#define HCS_CRUISE_DWELL_MS 300000UL
+#endif
+#ifndef HCS_CRUISE_MAX_PER_HOUR
+#define HCS_CRUISE_MAX_PER_HOUR 4
 #endif
 
 // ---------------------------------------------------------------------------------------------------------
@@ -219,13 +311,16 @@
 #ifndef HCS_MAX_FILL_MS_PER_HOUR
 #define HCS_MAX_FILL_MS_PER_HOUR 90000
 #endif
-// Leak latch: this many AIR_LOSS refills of one corner inside the window = a leak that pumping cannot fix.
-// The corner stops being refilled (one refill is re-granted each time a BLE client newly connects).
-#ifndef HCS_LEAK_FAULT_COUNT
-#define HCS_LEAK_FAULT_COUNT 4
+// Leak policy. Slow leaks are refilled indefinitely (bounded by the hourly budgets + compressor duty cap);
+// every refill logs the estimated leak rate. Only a FAST leak latches: HCS_LEAK_FAST_COUNT consecutive refills
+// each less than HCS_LEAK_FAST_INTERVAL_MS after the previous one (i.e. losing a full deadband in < 30 min,
+// a burst bag / failed fitting where pumping all night only drains the battery). A latched corner gets one
+// refill each time a BLE client newly connects. ; was: 4 refills in 6 h (too strict for a 1-2 psi/h leak)
+#ifndef HCS_LEAK_FAST_INTERVAL_MS
+#define HCS_LEAK_FAST_INTERVAL_MS (30UL * 60UL * 1000UL)
 #endif
-#ifndef HCS_LEAK_WINDOW_MS
-#define HCS_LEAK_WINDOW_MS (6UL * 3600UL * 1000UL)
+#ifndef HCS_LEAK_FAST_COUNT
+#define HCS_LEAK_FAST_COUNT 3
 #endif
 // After a user preset / manual valve move, wait this long with everything idle before re-baselining.
 #ifndef HCS_MANUAL_SETTLE_MS
@@ -258,8 +353,10 @@
 #ifndef HCS_CAL_MIN_SPAN
 #define HCS_CAL_MIN_SPAN 5.0f
 #endif
+// A healthy sensor on an empty bag (show / air-out preset) can read a few psi below 0; an open wire reads about
+// -29 psi (0 V vs the 0.5 V zero). ; was: -5
 #ifndef HCS_P_MIN_VALID
-#define HCS_P_MIN_VALID -5.0f
+#define HCS_P_MIN_VALID -12.0f
 #endif
 #ifndef HCS_P_MAX_VALID
 #define HCS_P_MAX_VALID 240.0f

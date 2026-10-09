@@ -46,6 +46,10 @@ void hcsNotifyPresetLoad(int profileIndex)
 
 void hcsNotifyManual()
 {
+    for (int i = 0; i < hcs::NC; i++)
+    {
+        getWheel(i)->releaseAutonomousPulse(); // the user's valve command owns the solenoids from here
+    }
     evManual = true;
 }
 
@@ -142,7 +146,19 @@ static void applyOutputs(const hcs::Outputs &out)
         {
             if (out.g[i].active)
             {
+                getWheel(i)->endAutonomousPulse();
                 getWheel(i)->requestAutonomousAbort();
+            }
+        }
+    }
+    else if (out.cmd == hcs::Cmd::PULSE)
+    {
+        for (int i = 0; i < hcs::NC; i++)
+        {
+            const hcs::GoalRequest &g = out.g[i];
+            if (g.active && g.dir > 0 && !getWheel(i)->startAutonomousPulse(g.pulseMs, g.ceilP))
+            {
+                Serial.printf("HCS wheel %d refused cruise pulse\n", i);
             }
         }
     }

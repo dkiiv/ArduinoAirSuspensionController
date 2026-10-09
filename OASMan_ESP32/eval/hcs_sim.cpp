@@ -9,12 +9,16 @@
 //   g++ -std=c++17 -O2 -Wall -o hcs_sim hcs_sim.cpp && ./hcs_sim          (summary)
 //   ./hcs_sim -v                                                          (with the full HCS decision log)
 //
-// Plant model (per corner, normalised): m = air mass, F = corner load, T = gas temperature factor.
-//   equilibrium:  m*T / F = 1 + (h - 50) / 60      -> h = 50 + 60 (mT/F - 1)   (height %, 50 = preset)
-//                 p = 100 F                         (psi; pressure carries the load, independent of air mass)
-//   so: more load  -> h down, p up      (LOAD, and the compressed corners on a crown / in a corner)
-//       less air   -> h down, p same    (leak, cooling)
-//   Extension is limited at h = 100 (wheel hanging: p then follows the air mass), compression at h = 0.
+// Plant model: a RIGID BODY (heave z, pitch, roll) on four isothermal air springs, solved for static
+// equilibrium every 100 ms (Newton, 3 unknowns).
+//   corner body height  zc_i = z + pitch * x_i + roll * y_i      (x: +1 front / -1 rear, y: +1 passenger / -1 driver)
+//   suspension length   h_i  = zc_i - g_i                        (g_i = ground height under that wheel = terrain)
+//   bag pressure        p_i  = 100 * m_i * T * (50 + 10) / (h_i + 10)   (p V = m R T, V ~ h + 10)
+//   force balance       sum p_i = W,  sum p_i x_i = Mx,  sum p_i y_i = My   (loads, braking, cornering)
+// So with no hand-tuned coupling: a crown (g warp) loads one diagonal and unloads the other; filling one corner
+// moves its neighbours AND shifts their load (pressures) the way a real body does; a leak lowers its corner and
+// re-distributes load; a corner whose length passes 100 has its wheel off the ground (jack) and carries nothing.
+// Bump stops below h = 2. Road input / sensor noise are added on top of the measurements only.
 
 #define HCS_HOST_BUILD
 #include "../src/heightControl/hcs_core.cpp"
@@ -65,9 +69,10 @@ struct Sim
 
     // plant
     float m[4] = {1, 1, 1, 1};
-    float baseF[4] = {1, 1, 1, 1};
-    float extraF[4] = {0, 0, 0, 0}; // people / cargo
-    float warp = 0, roll = 0, pitch = 0;
+    float extraF[4] = {0, 0, 0, 0}; // people / cargo at that corner, fraction of a corner's static load
+    float warp = 0;                 // ground warp (height %): FP+RD ground raised, FD+RP lowered (the hill spot crown)
+    float roll = 0, pitch = 0;      // lateral / longitudinal load transfer, fraction of total weight
+    float bz = 50, bp = 0, br = 0;  // body heave / pitch / roll (solved)
     float T = 1.0f;
     float leakPerHour[4] = {0, 0, 0, 0}; // fraction of air mass per hour
     bool jacked[4] = {false, false, false, false};
@@ -82,7 +87,10 @@ struct Sim
     bool manualIn[4] = {false, false, false, false};
     int valveTo[4] = {0, 1, 2, 3}; // physical corner whose bag the logical corner's valves actually feed
     Routine r[4];
+    uint32_t pulseUntil[4] = {0, 0, 0, 0};
     uint32_t seq = 0;
+    int pulses = 0, pulsesInEvent = 0, pulsesOn[4] = {0, 0, 0, 0};
+    uint32_t pulseMsTotal = 0;
 
     // calibration
     float calMin = 10, calMax = 90, minRide = 35;
@@ -105,34 +113,90 @@ struct Sim
             x = Routine();
     }
 
-    float F(int i) const
+    float F(int i) const { return p[i] / 100.0f; } // corner load fraction (diagnostics)
+
+    float pAir(int i, float L) const { return 100.0f * m[i] * T * 60.0f / ((L < 0 ? 0 : L) + 10.0f); }
+
+    // corner force on the body and its derivative w.r.t. the corner's body height
+    void cornerForce(int i, float L, float zc, float &f, float &d) const
     {
-        float f = baseF[i] * (1 + warp * WARP[i] + roll * ROLL[i] + pitch * PITCH[i]) + extraF[i];
-        if (jacked[i])
-            f = 0.02f;
-        return f < 0.02f ? 0.02f : f;
+        float La = L < 100 ? L : 100;
+        float pa = pAir(i, La);
+        float on = L <= 100 ? 1.0f : (L >= 101 ? 0.0f : 101 - L); // wheel leaves the ground past full extension
+        f = pa * on;
+        d = (L < 100 ? -pa / (La + 10) : 0) * on - (L > 100 && L < 101 ? pa : 0);
+        if (L < 2)
+        {
+            f += 60 * (2 - L);
+            d -= 60;
+        }
+        if (jacked[i] && zc < 120)
+        {
+            f += 40 * (120 - zc); // jack under the body at this corner
+            d -= 40;
+        }
     }
 
     void solve()
     {
+        static const float PX[4] = {+1, -1, +1, -1}, PY[4] = {+1, +1, -1, -1};
+        float W = 400, Mx = 400 * pitch, My = 400 * roll;
         for (int i = 0; i < 4; i++)
         {
-            float f = F(i);
-            float hh = 50 + 60 * (m[i] * T / f - 1);
-            float pp = 100 * f;
-            if (hh > 100)
+            W += 100 * extraF[i];
+            Mx += 100 * extraF[i] * PX[i];
+            My += 100 * extraF[i] * PY[i];
+        }
+        for (int it = 0; it < 30; it++)
+        {
+            float R[3] = {-W, -Mx, -My}, J[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+            for (int i = 0; i < 4; i++)
             {
-                hh = 100;
-                pp = 100 * m[i] * T / (1 + 50.0f / 60.0f);
+                float zc = bz + bp * PX[i] + br * PY[i];
+                float L = zc - warp * WARP[i];
+                float f, d;
+                cornerForce(i, L, zc, f, d);
+                float sv[3] = {1, PX[i], PY[i]};
+                for (int r2 = 0; r2 < 3; r2++)
+                {
+                    R[r2] += f * sv[r2];
+                    for (int c2 = 0; c2 < 3; c2++)
+                        J[r2][c2] += d * sv[r2] * sv[c2];
+                }
             }
-            if (hh < 0)
+            if (fabsf(R[0]) + fabsf(R[1]) + fabsf(R[2]) < 1e-3f)
+                break;
+            for (int k = 0; k < 3; k++)
+                J[k][k] -= 1e-3f; // regularise (all wheels hanging)
+            // solve J * dx = -R (Cramer)
+            float det = J[0][0] * (J[1][1] * J[2][2] - J[1][2] * J[2][1]) - J[0][1] * (J[1][0] * J[2][2] - J[1][2] * J[2][0]) +
+                        J[0][2] * (J[1][0] * J[2][1] - J[1][1] * J[2][0]);
+            if (fabsf(det) < 1e-9f)
+                break;
+            float dx[3];
+            for (int c2 = 0; c2 < 3; c2++)
             {
-                hh = 0;
-                float pAir = 100 * m[i] * T / (1 - 50.0f / 60.0f);
-                pp = pAir < pp ? pAir : pp;
+                float M[3][3];
+                for (int r2 = 0; r2 < 3; r2++)
+                    for (int k = 0; k < 3; k++)
+                        M[r2][k] = (k == c2) ? -R[r2] : J[r2][k];
+                dx[c2] = (M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1]) - M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0]) +
+                          M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0])) / det;
+                if (dx[c2] > 5)
+                    dx[c2] = 5;
+                if (dx[c2] < -5)
+                    dx[c2] = -5;
             }
-            h[i] = hh;
-            p[i] = pp;
+            bz += dx[0];
+            bp += dx[1];
+            br += dx[2];
+        }
+        for (int i = 0; i < 4; i++)
+        {
+            float L = bz + bp * PX[i] + br * PY[i] - warp * WARP[i];
+            float La = L < 0 ? 0 : (L > 100 ? 100 : L);
+            h[i] = La;
+            p[i] = pAir(i, La); // a hanging wheel's bag sits at full extension
         }
     }
 
@@ -158,7 +222,14 @@ struct Sim
         for (int i = 0; i < 4; i++)
         {
             Routine &R = r[i];
-            bool inOpen = manualIn[i], outOpen = false;
+            bool pulsing = pulseUntil[i] != 0 && (int32_t)(t - pulseUntil[i]) < 0;
+            if (pulseUntil[i] != 0 && !pulsing)
+                pulseUntil[i] = 0;
+            if (pulsing && (fabsf(roll) > 0.01f || fabsf(pitch) > 0.01f))
+                pulsesInEvent++; // a valve open at speed while the body is loaded by a corner / brake event
+            if (pulsing)
+                pulseMsTotal += dtMs;
+            bool inOpen = manualIn[i] || pulsing, outOpen = false;
             if (R.active)
             {
                 bool stop = (t - R.start) > (R.autonomous ? (uint32_t)HCS_ROUTINE_TIMEOUT_MS : 15000u);
@@ -211,15 +282,15 @@ struct Sim
             float hm = h[i] + 0.15f * N(rng) + road;
             float hmc = hm < 0 ? 0 : (hm > 100 ? 100 : hm);
             float pm = p[i] + 0.25f * N(rng) + proad;
-            bool vo = manualIn[i] || r[i].active;
-            if (vo && (manualIn[i] || r[i].dir > 0))
+            bool vo = manualIn[i] || r[i].active || pulseUntil[i] != 0;
+            if (vo && (manualIn[i] || pulseUntil[i] != 0 || r[i].dir > 0))
                 pm += 0.4f * (tank - p[i]); // flow offset
             if (vo && r[i].dir < 0 && !manualIn[i])
                 pm *= 0.7f;
             in.c[i].h = hmc;
             in.c[i].hRaw = std::isnan(rawFault[i]) ? calMin + hm * (calMax - calMin) / 100.0f : rawFault[i];
             in.c[i].p = pm;
-            in.c[i].inOpen = manualIn[i] || (r[i].active && r[i].dir > 0);
+            in.c[i].inOpen = manualIn[i] || pulseUntil[i] != 0 || (r[i].active && r[i].dir > 0);
             in.c[i].outOpen = r[i].active && r[i].dir < 0;
             in.c[i].routineActive = r[i].active;
             in.c[i].routineAutonomous = r[i].active && r[i].autonomous;
@@ -275,11 +346,32 @@ struct Sim
         }
         else if (out.cmd == Cmd::ABORT)
         {
-            aborts++;
-            lastAbortAt = t;
+            bool wasPulse = false;
             for (int i = 0; i < 4; i++)
+            {
+                if (out.g[i].active && pulseUntil[i] != 0)
+                {
+                    pulseUntil[i] = 0;
+                    wasPulse = true;
+                }
                 if (out.g[i].active && r[i].autonomous)
                     r[i].active = false;
+            }
+            if (!wasPulse)
+            {
+                aborts++;
+                lastAbortAt = t;
+            }
+        }
+        else if (out.cmd == Cmd::PULSE)
+        {
+            for (int i = 0; i < 4; i++)
+                if (out.g[i].active)
+                {
+                    pulseUntil[i] = t + out.g[i].pulseMs + 100; // adapter closes on the core's ABORT, +1 tick
+                    pulses++;
+                    pulsesOn[i]++;
+                }
         }
         if (out.persistNow && core.exportPersist(blob))
             haveBlob = true;
@@ -305,7 +397,7 @@ struct Sim
     }
 
     // driving segment: roughness plus cornering / braking events
-    void drive(float seconds, float roughness, bool events = true)
+    void drive(float seconds, float roughness, bool events = true, float period = 60.0f)
     {
         moving = true;
         rough = roughness;
@@ -314,7 +406,7 @@ struct Sim
             t0 += 0.1f;
             if (!events)
                 return;
-            float ph = fmodf(t0, 60.0f);
+            float ph = fmodf(t0, period);
             s.roll = (ph > 10 && ph < 30) ? 0.15f : ((ph > 35 && ph < 45) ? -0.12f : 0.0f); // long sweepers
             s.pitch = (ph > 50 && ph < 53) ? 0.20f : ((ph > 55 && ph < 58) ? -0.10f : 0.0f); // braking / accel
         });
@@ -386,7 +478,7 @@ static void scenarioHill()
     // parking manoeuvre onto the crown: warp builds up while still rolling
     s.moving = true;
     s.rough = 0.6f;
-    s.run(8, [](Sim &x) { x.warp += 0.15f / 80; x.pitch += 0.04f / 80; });
+    s.run(8, [](Sim &x) { x.warp += 9.0f / 80; x.pitch += 0.04f / 80; }); // ~9 % ground crown, nose-down slope
     s.rough = 0;
     s.moving = false;
     size_t mark = g_log.size();
@@ -409,20 +501,21 @@ static void scenarioHill()
     printf("  after 8 h: FP=%.1f RP=%.1f FD=%.1f RD=%.1f, %d batches, RP fills=%d\n", s.h[0], s.h[1], s.h[2], s.h[3], s.starts - startsBefore,
            s.fillsOn[C_RP]);
     check(s.dumpsOn[C_FD] == 0 && s.dumpsOn[C_RP] == 0, "S1", "never dumped the hanging corners (FD, RP)");
-    check(s.h[C_FP] < 46 && s.h[C_RD] < 46, "S1", fmt("compressed corners left compressed (FP=%.1f RD=%.1f, flat preset is 50)", s.h[C_FP], s.h[C_RD]));
+    check(s.h[C_FP] - arr[C_FP] <= 1.5f && s.h[C_RD] - arr[C_RD] <= 1.5f && s.h[C_FP] < 46 && s.h[C_RD] < 48, "S1",
+          fmt("compressed corners never pushed toward flat (FP %.1f->%.1f, RD %.1f->%.1f; flat preset is 50)", arr[C_FP], s.h[C_FP],
+              arr[C_RD], s.h[C_RD]));
     check(worst <= HCS_DEADBAND_H + 1.0f, "S1", fmt("car held at its ARRIVAL geometry (worst corner %.1f%% from arrival)", worst));
     check(s.fillsOn[C_RP] >= 1, "S1", "slow leak on RP refilled toward its arrival height");
-    check(countLog("LEAK RP") == 0, "S1", "slow leak did not trip the leak latch");
+    check(countLog("FAST leak latched") == 0, "S1", "slow leak did not trip the leak latch");
 }
 
 // R5: driving / cornering / braking / smooth highway / red lights, with a leak and a passenger tempting the classifier
 static void scenarioDriving()
 {
-    printf("\nS2 driving: sweepers, braking, smooth highway, red lights, leak present\n");
+    printf("\nS2 driving: sweepers, braking, smooth highway, red lights (no leak: nothing may actuate)\n");
     Sim s;
     g_log.clear();
     parkedAtPreset(s);
-    s.leakPerHour[C_RD] = 0.10f; // fairly fast leak while driving
     for (int lap = 0; lap < 6; lap++)
     {
         s.drive(240, 0.8f);         // normal road with sweepers / braking
@@ -432,7 +525,8 @@ static void scenarioDriving()
     }
     printf("  starts while moving=%d, valve-ms while moving=%u, DRIVING confirmations=%d, total starts=%d\n", s.startsWhileMoving,
            s.valveMsWhileMoving, countLog("DRIVING confirmed"), s.starts);
-    check(s.startsWhileMoving == 0 && s.valveMsWhileMoving == 0, "S2", "zero autonomous actuation while moving (cornering, braking, highway)");
+    check(s.startsWhileMoving == 0 && s.valveMsWhileMoving == 0 && s.pulses == 0, "S2",
+          "zero autonomous actuation while moving incl. cruise top-up (cornering, braking, highway)");
     check(s.starts == 0, "S2", "no actuation at 60 s red lights either (arrival quiet = 120 s)");
 
     printf("  worst case: motion detector BLIND (sensor-noise-only road) during a 5 min sustained sweeper\n");
@@ -485,7 +579,8 @@ static void scenarioLeakBelowMin()
     f.run(200);
     printf("  RD after boot: %.1f, starts=%d\n", f.h[C_RD], f.starts);
     check(f.h[C_RD] >= f.minRide + HCS_FLOOR_LIFT_MARGIN - 1.0f, "S3", "BOTTOM_GUARD lifts an unanchored corner to min ride + margin");
-    check(f.h[C_FP] < 52 && f.h[C_FD] < 52, "S3", "other corners untouched");
+    check(f.fillsOn[C_FP] + f.fillsOn[C_RP] + f.fillsOn[C_FD] + f.dumpsOn[C_FP] + f.dumpsOn[C_RP] + f.dumpsOn[C_FD] == 0, "S3",
+          fmt("only RD actuated (the others moved by body coupling only: FP=%.1f RP=%.1f FD=%.1f)", f.h[C_FP], f.h[C_RP], f.h[C_FD]));
 }
 
 // R3: load / unload compensation, small load ignored
@@ -599,15 +694,11 @@ static void scenarioJack()
     parkedAtPreset(s);
     s.disturbance(20, 1.2f);
     s.jacked[C_RP] = true;
-    s.extraF[C_RD] += 0.2f;
-    s.extraF[C_FP] += 0.1f;
     s.run(1800);
     printf("  RP h=%.1f p=%.1f, starts=%d\n", s.h[C_RP], s.p[C_RP], s.starts);
     check(countLog("EXTERNAL") >= 1 && s.starts == 0, "S8", "EXTERNAL support detected, zero autonomous actuation while jacked");
     s.disturbance(10, 1.2f);
     s.jacked[C_RP] = false;
-    s.extraF[C_RD] -= 0.2f;
-    s.extraF[C_FP] -= 0.1f;
     s.run(300);
     check(countLog("EXTERNAL cleared") == 1, "S8", "freeze released once the car is back on its wheels");
 }
@@ -643,7 +734,7 @@ static void scenarioManual()
 // Fast leak latch + owner-return allowance
 static void scenarioFastLeak()
 {
-    printf("\nS10 fast leak on RD: latch after %d refills, one refill per owner return\n", HCS_LEAK_FAULT_COUNT);
+    printf("\nS10 fast leak on RD (25 %%/h of its air): latch after %d fast refills, one refill per owner return\n", HCS_LEAK_FAST_COUNT);
     Sim s;
     g_log.clear();
     parkedAtPreset(s);
@@ -651,7 +742,7 @@ static void scenarioFastLeak()
     s.run(6 * 3600);
     printf("  RD fills=%d, latched=%d\n", s.fillsOn[C_RD], countLog("LEAK RD:"));
     check(countLog("LEAK RD:") == 1, "S10", "leak latch tripped");
-    check(s.fillsOn[C_RD] <= HCS_LEAK_FAULT_COUNT + 1, "S10", fmt("compressor not run endlessly (RD fills=%d)", s.fillsOn[C_RD]));
+    check(s.fillsOn[C_RD] <= HCS_LEAK_FAST_COUNT + 2, "S10", fmt("compressor not run endlessly (RD fills=%d)", s.fillsOn[C_RD]));
     int f0 = s.fillsOn[C_RD];
     s.presence = false;
     s.run(600);
@@ -673,6 +764,120 @@ static void scenarioLowPreset()
     s.core.notifyPresetLoad(ph);
     s.run(600);
     check(s.starts == 0 && s.h[C_FP] < 30, "S11", "explicit user preset below min ride is held, not lifted");
+}
+
+// Show mode: user preset with every corner at 0 (bags dumped, car on its bump stops)
+static void scenarioShowMode()
+{
+    printf("\nS11b show preset: all corners 0 %% height / ~0 psi, phone connected, people get in and out\n");
+    Sim s;
+    g_log.clear();
+    parkedAtPreset(s);
+    for (int i = 0; i < 4; i++)
+        s.m[i] = 0.02f; // the user's preset routine dumped everything
+    uint8_t ph[4] = {0, 0, 0, 0};
+    s.core.notifyPresetLoad(ph);
+    s.run(120);
+    printf("  aired out: FP=%.1f RP=%.1f FD=%.1f RD=%.1f psi FP=%.1f\n", s.h[0], s.h[1], s.h[2], s.h[3], s.p[0]);
+    s.disturbance(8);
+    s.extraF[C_FD] += 0.15f;
+    s.run(600);
+    s.disturbance(8);
+    s.extraF[C_FD] -= 0.15f;
+    s.run(2 * 3600);
+    check(s.starts == 0, "S11b", fmt("show preset held: zero autonomous actuation in 2 h (starts=%d)", s.starts));
+    check(countLog("FAULT") == 0, "S11b", "no false sensor fault on empty bags");
+}
+
+// Strong body coupling with CORRECT wiring must never trip the mapping guard
+static void scenarioCoupling()
+{
+    printf("\nS13 rigid-body coupling: every fill moves the neighbours too (correct wiring)\n");
+    Sim s;
+    g_log.clear();
+    parkedAtPreset(s);
+    s.leakPerHour[C_RD] = 0.04f; // single-corner refills: the body tilts, neighbours follow
+    s.run(3 * 3600);
+    s.leakPerHour[C_RD] = 0;
+    s.disturbance(8);
+    s.extraF[C_RP] += 0.14f; // uneven rear load -> axle batch with one corner needing much less
+    s.extraF[C_RD] += 0.05f;
+    s.run(900);
+    printf("  starts=%d, final FP=%.1f RP=%.1f FD=%.1f RD=%.1f\n", s.starts, s.h[0], s.h[1], s.h[2], s.h[3]);
+    check(countLog("MAPPING") == 0, "S13", "no mapping fault from normal neighbour movement");
+    check(s.starts >= 1 && s.core.state() != State::FAULT, "S13", fmt("corrections kept working (%d batches)", s.starts));
+    float worst = 0;
+    for (int i = 0; i < 4; i++)
+        worst = fmaxf(worst, fabsf(s.h[i] - 50));
+    check(worst <= HCS_DEADBAND_H + 0.5f, "S13", fmt("all corners within deadband despite coupling (worst %.1f)", worst));
+}
+
+// The owner's real leak: rear driver (RD) on the hill spot, compressed overnight, ~1-2 psi/h
+static void scenarioOwnersLeak()
+{
+    printf("\nS14 owner's leak: RD compressed on the hill spot, 2 %%/h of its air, 24 h connected\n");
+    Sim s;
+    g_log.clear();
+    parkedAtPreset(s);
+    s.drive(300, 0.8f);
+    s.moving = true;
+    s.rough = 0.6f;
+    s.run(8, [](Sim &x) { x.warp += 9.0f / 80; });
+    s.rough = 0;
+    s.moving = false;
+    s.run(300);
+    float arrRD = s.h[C_RD];
+    s.leakPerHour[C_RD] = 0.02f;
+    float worstRD = 0;
+    s.run(24 * 3600, [&](Sim &x) { worstRD = fmaxf(worstRD, arrRD - x.h[C_RD]); });
+    printf("  RD arrival %.1f, now %.1f, worst sag %.1f, RD fills=%d, latched=%d\n", arrRD, s.h[C_RD], worstRD, s.fillsOn[C_RD],
+           countLog("FAST leak latched"));
+    check(countLog("FAST leak latched") == 0, "S14", "slow leak never latched");
+    check(worstRD <= HCS_DEADBAND_H + 1.0f, "S14", fmt("RD held at its arrival height all day (worst sag %.1f)", worstRD));
+    check(countLog("LEAK RD refill") >= 1, "S14", "leak rate logged on every refill");
+}
+
+// Road trip: 4 h of continuous driving with a slow leak -> cruise top-up keeps the corner up, only when steady
+static void scenarioRoadTrip()
+{
+    printf("\nS15 road trip: 4 h non-stop, RD leaking 2.5 %%/h of its air; 5 min twisty / 5 min highway alternating\n");
+    Sim s;
+    g_log.clear();
+    parkedAtPreset(s);
+    // one parked correction first so the RD fill rate is learned (as it would be in daily use)
+    s.disturbance(6);
+    s.extraF[C_RD] += 0.10f;
+    s.run(120);
+    s.disturbance(6);
+    s.extraF[C_RD] -= 0.10f;
+    s.run(900);
+    s.leakPerHour[C_RD] = 0.025f;
+    float worstLate = 0;
+    float mStart = s.m[C_RD];
+    for (int seg = 0; seg < 24; seg++) // 24 x 10 min
+    {
+        s.drive(300, 0.8f, true);         // twisty: a sweeper / brake event every minute
+        s.drive(300, 0.35f, true, 150.0f); // highway: an event every 2.5 min
+        if (seg >= 6)
+        {
+            float others = (s.h[C_FP] + s.h[C_RP] + s.h[C_FD]) / 3.0f;
+            worstLate = fmaxf(worstLate, others - s.h[C_RD]);
+        }
+    }
+    printf("  pulses: FP=%d RP=%d FD=%d RD=%d (total %u ms), pulses overlapping a corner/brake event: %d\n", s.pulsesOn[0], s.pulsesOn[1],
+           s.pulsesOn[2], s.pulsesOn[3], s.pulseMsTotal, s.pulsesInEvent);
+    printf("  RD air lost %.1f%% to the leak; worst RD deficit vs others after the first hour: %.1f%%\n", (mStart - s.m[C_RD]) * 100.0f,
+           worstLate);
+    s.roll = s.pitch = 0;
+    s.solve();
+    printf("  static now: h FP=%.1f RP=%.1f FD=%.1f RD=%.1f | p FP=%.1f RP=%.1f FD=%.1f RD=%.1f\n", s.h[0], s.h[1], s.h[2], s.h[3], s.p[0],
+           s.p[1], s.p[2], s.p[3]);
+    check(s.pulsesOn[C_RD] >= 1 && s.pulsesOn[C_FP] + s.pulsesOn[C_RP] + s.pulsesOn[C_FD] == 0, "S15", "only the leaking corner topped up");
+    check(s.startsWhileMoving == 0, "S15", "no closed-loop goal routine while moving (pulses only)");
+    check(s.pulsesInEvent == 0, "S15", "no valve open during any cornering / braking event");
+    check(worstLate <= 6.0f, "S15", fmt("RD kept within %.1f%% of the others (no top-up: grows ~1.5 %%/h)", worstLate));
+    check(s.presence, "S15", "(precondition) phone connected for the whole trip");
+    check(countLog("FAST leak latched") == 0, "S15", "slow leak not latched");
 }
 
 // Valve / sensor corner mapping mismatch (e.g. a pin reorder applied to valves but not to height channels)
@@ -708,7 +913,11 @@ int main(int argc, char **argv)
     scenarioManual();
     scenarioFastLeak();
     scenarioLowPreset();
+    scenarioShowMode();
     scenarioMapping();
+    scenarioCoupling();
+    scenarioOwnersLeak();
+    scenarioRoadTrip();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
