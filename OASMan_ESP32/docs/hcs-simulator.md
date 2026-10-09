@@ -34,7 +34,7 @@ g++ -std=c++17 -O2 -DHCS_MOTION_H_THRESH=1.0f -DHCS_CONFIRM_MS=0 -o hcs_sim_test
 HCS_DUMP_FROM=790000 HCS_DUMP_TO=800000 ./hcs_sim S1
 ```
 
-Runtime: all scenarios together take about a second of wall time and cover ~45 simulated hours.
+Runtime: all scenarios together take about five seconds of wall time and cover ~75 simulated hours.
 
 ## The simulated car
 
@@ -47,7 +47,7 @@ A **rigid body** (heave, pitch, roll) on four air springs, solved for static equ
   - `extraF[i]`: people or cargo at a corner, as a fraction of a corner's static load.
   - `roll` / `pitch`: cornering or braking load transfer, as a fraction of total weight.
   - `heave`: vertical g minus 1 (+0.3 = the bottom of a dip at 1.3 g).
-- **Ground.** `warp` is a crown, in height %: FP and RD up, FD and RP down. This is the hill spot.
+- **Ground.** `warp` is a crown, in height %: FP and RD up, FD and RP down. This is the hill spot. `ground[i]` adds extra ground height under one wheel. Past 100 % a wheel leaves the ground and its bag carries only the wheel (severe crowns hit this, as on the owner's spot).
 - **Air.** `leakPerHour[i]` is the share of a bag's air lost per hour. `T` models heating and cooling.
 - **Compressor.** On below 140 psi and off at 180, **only with a BLE client** (like `compressor.cpp`). It adds 1 psi/s.
 - **Valves.** Flow is proportional to the tank-to-bag difference.
@@ -92,6 +92,7 @@ Calibration is fixed at raw 10..90 with min ride 35. These are the gaps the fiel
 | S16 | dips and the bottom of hills at speed: normal road, glass-smooth road, long highway sags; then real load after parking | no fill, dump or pulse in any case; the confirmation rule exercised and holding; weight after parking still compensated |
 | S17 | the shadow build: leak plus load for 2 h, phone connected | logs `SHADOW would START`; zero actuation; no leak bookkeeping from decisions that never ran |
 | S18 | get in and drive from the hill spot: no BLE overnight, trunk + passenger loaded with the car off, controller connects when the driver sits, drive off 8 s later; arrive on flat ground, or back on the crown; plus a "nobody drives off" variant | level plane back at the preset (twist removed) within the deadband after arrival; the crown's twist kept at home; prints the drive-away pulses and how fast the parked correction starts |
+| S19 | the owner's real spot (twist ~-33 %: FP 34, RP 87, FD 100, RD 23): park, night with an RD leak and no BLE, load with the car off, leave; arrive on flat ground, come back, or stay | nothing actuated at the spot (the hanging, unloaded wheel freezes it as EXTERNAL); hanging corners never dumped; on the road the load + leak are topped up; flat arrival level to the preset; back at the spot the twist is kept |
 
 (S12, the valve/sensor cross-wiring scenario, was removed together with that check.)
 

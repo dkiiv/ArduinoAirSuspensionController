@@ -229,10 +229,11 @@ void Core::driveLoadCheck(const Inputs &in)
     for (int i = 0; i < NC; i++)
     {
         const Corner &k = c[i];
-        if (k.pFault || k.owe > 0.5f || !k.tgtValid || !finite_(k.pRef))
+        const float pr = roadValid ? k.pRoad : k.pRef; // last trip's road average beats any parking-spot reference
+        if (k.pFault || k.owe > 0.5f || !k.tgtValid || !finite_(pr))
             return; // owed already (parked decision) or no load reference
         hmean[i] = k.sdH / sdN;
-        load += 0.25f * ((k.sdP / sdN) - k.pRef) / fmaxf_(finite_(k.pScale) ? k.pScale : k.pRef, HCS_PREF_MIN_PSI);
+        load += 0.25f * ((k.sdP / sdN) - pr) / fmaxf_(finite_(k.pScale) ? k.pScale : pr, HCS_PREF_MIN_PSI);
         ref[i] = presetValid ? (float)presetH[i] : k.tgt;
         wRef += 0.25f * TW[i] * ref[i];
         wCur += 0.25f * TW[i] * hmean[i];
@@ -251,8 +252,8 @@ void Core::driveLoadCheck(const Inputs &in)
     for (int i = 0; i < NC; i++)
         if (d[i] > HCS_LAND_TOL && c[i].floorOverride < 0)
             c[i].owe = fminf_(d[i], HCS_OWE_MAX);
-    logf("DRIVE LOAD: load %+.1f%% since parking, level plane low by FP %.1f RP %.1f FD %.1f RD %.1f -> top up in steady driving",
-         load * 100.0f, d[C_FP], d[C_RP], d[C_FD], d[C_RD]);
+    logf("DRIVE LOAD: load %+.1f%% vs %s, level plane low by FP %.1f RP %.1f FD %.1f RD %.1f -> top up in steady driving",
+         load * 100.0f, roadValid ? "the last trip" : "the last parking", d[C_FP], d[C_RP], d[C_FD], d[C_RD]);
 }
 
 // Drive-away top-up: deliver what a parked evaluation decided (load / leak, on steady readings) but could not finish

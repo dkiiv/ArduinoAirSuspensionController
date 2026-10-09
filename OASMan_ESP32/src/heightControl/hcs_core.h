@@ -187,6 +187,7 @@ private:
         float batchGoal;
         float fillRate; // height % per second of open IN valve, learned from parked fills (cruise pulse sizing)
         float sdH, sdP; // drive-long sums for the drive-away load check
+        float pRoad;    // mean bag pressure over the last drive: a load reference that does not depend on a parking spot
         float calmLo, calmHi;
         float oweCand;  // fill the last parked evaluation wanted (height %), becomes owe when DRIVING is confirmed
         float owe;      // drive-away top-up still to deliver (height %)
@@ -227,7 +228,7 @@ private:
     // cruise
     uint32_t driveStartAt, steadySince, cruiseEvalAt, pulseEnd, oweAt, driveLoadAt;
     uint32_t sdN;
-    bool driveLoadDone, pulseOwe;
+    bool driveLoadDone, pulseOwe, roadValid;
     uint32_t calmSince, pulseStartAt, pulseMs;
     float pulseStep;
     int driveLoadCnt;
@@ -272,6 +273,7 @@ private:
                  int8_t &dir, float &goal);
     const char *gate(const Inputs &in, int i, int8_t dir, bool pOk, float pm) const;
     void retargetArrival(const Inputs &in, const float *hm);
+    bool planeDeficit(const float *h, float *d) const; // per corner: target plane - current plane, twist removed
     uint32_t steadyRemaining() const; // 0 = every healthy corner steady for HCS_CONFIRM_MS; 0xFFFFFFFF = not steady
     // hcs_cruise.cpp
     void cruiseTick(const Inputs &in, Outputs &out);

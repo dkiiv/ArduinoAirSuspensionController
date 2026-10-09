@@ -60,6 +60,12 @@ pio device monitor -b 115200 -f time -f log2file
 
 Or run `python3 eval/hcs_logger.py --dir hcs_logs` on any Linux machine. On WSL, attach the USB device first: `usbipd attach --wsl --busid <id>` in an admin PowerShell.
 
+### What the log contains (and what it does not)
+
+Only time and what the manifold measures and decides: heights, pressures, tank, valve and compressor state, BLE presence, and the supervisor's decisions. There is **no door, seat, gear or load input**. Words like "disturbance", "LOAD" or "DRIVING" in the log are the supervisor's own inferences from those sensors. Comparing them with what really happened is the point of the notes below.
+
+The `HCS t=` counter is the manifold's uptime in ms. Your board never powers off, so it wraps to 0 every 49.7 days. The logger's wall-clock stamp is the one to trust, provided the comma's clock had synced. Right after a comma boot the clock can be off until it syncs; the uptime counter still orders events correctly.
+
 ### What to send
 
 The logger keeps only lines starting `HCS t=` (decisions), `HCSD` (1 Hz state) and `HRAW` (raw sensor volts). Send the day files plus a one-line note per event: what happened and roughly when. For example:
@@ -74,7 +80,7 @@ All of these happen in normal use once the logger runs. Only number 3 needs you 
 
 | # | Session | How | What it settles |
 |---|---|---|---|
-| 1 | **Parked nights at home** (the hill spot) | nothing to do | `STATS QUIET`: the parked noise floor of the motion detector, and `sdH` / `sdP` (height and pressure noise). The `ARRIVAL targets ... twist` line: how much twist the crown really puts on the car. Overnight `EVAL` lines (vetoed, no BLE, but still logged): the RD leak and cooling, hour by hour |
+| 1 | **Parked nights at home** (the hill spot) | nothing to do | Expect `EXTERNAL ... bag lost N%` on arrival: the hanging wheel is nearly unloaded. N tells how close the spot is to that line. `STATS QUIET`: the parked noise floor of the motion detector, and `sdH` / `sdP` (height and pressure noise). The `ARRIVAL targets ... twist` line: how much twist the crown really puts on the car. Overnight `EVAL` lines (vetoed, no BLE, but still logged): the RD leak and cooling, hour by hour |
 | 2 | **Normal drives**, ideally one with a long smooth highway stretch, a few dips, the bottom of a hill at speed, and the drive up into the hill spot | nothing to do | `STATS DRIVE`: the driving signal vs the thresholds. `MOTION` / `DRIVING confirmed` timing (pulling away, red lights). Any `SHADOW would START` while moving is a failure: tell me where and when. `DRIVE LOAD` lines on drives where nobody was added would be false positives |
 | 3 | **Known loads, parked, controller connected** | car on, in P, controller connected: driver in / out; one rear passenger; two; then 10 kg and 20 kg in the trunk (water bottles), a minute apart, with notes | `EVAL ... load=+x%` per known weight sets `HCS_LOAD_FRAC` from data. The `air=same/lost/gained` values show whether the sign test holds on your bags (unchanged air must read `same`). If door events show `lost` / `gained`, the bags have hysteresis, which matters a lot |
 | 4 | **Get in and drive** (your usual) | nothing special: note when people and cargo went in and when you left | the `DRIVE-AWAY` / `DRIVE LOAD` decisions the shadow build would have taken, and when |
@@ -103,6 +109,8 @@ Known so far:
 - Travel: about 1 ft (~300 mm) from 0 psi on the bump stops to max pressure. So 1 % of calibrated travel is ~3 mm: the 3 % deadband is ~9 mm, and the 0.7 % motion threshold ~2 mm.
 - Tank 4 gal; two 480C-type compressors.
 - Phone not connected overnight; the in-car controller connects when the car powers up. So "BLE connected" means "car in use", and nothing is corrected while the car sleeps (leaks are logged and corrected at the next power-up).
+- The manifold runs 24/7 (constant 12 V), so its state stays in RAM between trips (learned fill rates, last-trip road pressures). The supervisor's timing is wrap-safe across the 49.7-day `millis()` rollover. The few legacy comparisons that are not only misbehave in a window of seconds at the wrap (an early timeout).
+- Home spot: FD and RP read 80-100 %, FP 30-35 %, RD 15-20 % (stock tesla branch screen).
 
 Still useful:
 - the per-corner travel, if the front and rear differ;

@@ -49,17 +49,20 @@ Cls Core::classify(const Inputs &in, int i, float hm, bool pOk, float pm, int lo
         }
         k.completeCls = Cls::NONE;
     }
-    if (hm < floorTrigger(in, i))
+    // Below min ride / above the ceiling act only on AIR: a bag that lost air (leaked down overnight) or one we know
+    // nothing about is lifted; a corner pressed down or hanging off uneven ground with its air intact is terrain.
+    const bool airUnknown = !pOk || !finite_(k.airP);
+    if (hm < floorTrigger(in, i) && (airUnknown || airChg < 0))
     {
-        dir = +1; // below min ride (e.g. leaked down overnight): lift to the target, at least min ride + margin
+        dir = +1; // lift to the target, at least min ride + margin
         goal = fminf_(fmaxf_(k.tgt, liftTarget(in, i)), ch);
         return Cls::BOTTOM_GUARD;
     }
     if (hm > ch + HCS_DEADBAND_H)
     {
-        if (HCS_AUTO_LOWER)
+        if (HCS_AUTO_LOWER && airChg > 0)
         {
-            dir = -1;
+            dir = -1; // over-extended by heat
             goal = ch;
         }
         return Cls::CEILING;
@@ -123,6 +126,24 @@ const char *Core::gate(const Inputs &in, int i, int8_t dir, bool pOk, float pm) 
 // roll: what the user asked for) plus THIS spot's twist. Twist (FP + RD - FD - RP) is what uneven ground does to a
 // rigid car -- a crown puts one diagonal up and the other down -- and it is never corrected. Load (people, cargo)
 // and leaks change the plane, so they still show up against these targets.
+// Plane deficit: (targets' level plane) - (heights' level plane) at each corner, twist removed from both. > 0 means
+// the car sits low there for reasons other than the ground's twist (load, air). False if a height sensor is faulted.
+bool Core::planeDeficit(const float *h, float *d) const
+{
+    static const float TW[NC] = {+1, -1, -1, +1};
+    float wT = 0, wH = 0;
+    for (int i = 0; i < NC; i++)
+    {
+        if (c[i].hFault || !c[i].tgtValid)
+            return false;
+        wT += 0.25f * TW[i] * c[i].tgt;
+        wH += 0.25f * TW[i] * h[i];
+    }
+    for (int i = 0; i < NC; i++)
+        d[i] = (c[i].tgt - TW[i] * wT) - (h[i] - TW[i] * wH);
+    return true;
+}
+
 void Core::retargetArrival(const Inputs &in, const float *hm)
 {
     static const float TW[NC] = {+1, -1, -1, +1}; // FP RP FD RD
@@ -181,7 +202,8 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
         k.tgt = fminf_(hm[i], ceilH());
         k.pRef = k.pScale = pOk[i] ? pm[i] : NAN;
         k.airH = hm[i];
-        k.airP = k.pRef;
+        // no history: a corner already below min ride may have leaked there -> air unknown, so it gets lifted
+        k.airP = hm[i] < floorTrigger(in, i) ? NAN : k.pRef;
         k.tgtValid = true;
         logf("BASELINE %s init tgt=%.1f pRef=%.1f", CN[i], k.tgt, k.pRef);
         markPersist(false);
@@ -204,7 +226,15 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
         }
     }
     const float load = nl ? sum / nl : 0;
-    const int loadDir = nl < 3 ? L_UNKNOWN : load > HCS_LOAD_FRAC ? L_UP : load < -HCS_LOAD_FRAC ? L_DOWN : L_NEUTRAL;
+    // After a drive the load references belong to another parking spot: on uneven ground the bags share the load
+    // differently (a hanging wheel carries almost nothing), so pressures are not comparable. Load added before
+    // leaving is judged on the road instead (driveLoadCheck); here only AIR (sign test) and safety count.
+    const bool afterDrive = strcmp(kind, "ARRIVAL") == 0;
+    const int loadDir = afterDrive  ? L_NEUTRAL
+                        : nl < 3    ? L_UNKNOWN
+                        : load > HCS_LOAD_FRAC ? L_UP
+                        : load < -HCS_LOAD_FRAC ? L_DOWN
+                                                 : L_NEUTRAL;
     if (ext >= 0)
     {
         if (!externalFreeze)
@@ -225,7 +255,8 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
     if (periodic)
         logq("EVAL %s load=%+.1f%% (%s, n=%d) pres=%d", kind, load * 100.0f, LN[loadDir], nl, in.presence ? 1 : 0);
     else
-        logf("EVAL %s load=%+.1f%% (%s, n=%d) tank=%.0f pres=%d", kind, load * 100.0f, LN[loadDir], nl, tank, in.presence ? 1 : 0);
+        logf("EVAL %s load=%+.1f%% (%s%s, n=%d) tank=%.0f pres=%d", kind, load * 100.0f, LN[loadDir], afterDrive ? ": not compared across spots" : "", nl,
+             tank, in.presence ? 1 : 0);
 
     // ---- 4. sign test per bag; >= 3 bags agreeing = temperature, not "another bag's event"
     int8_t airChg[NC];
@@ -329,6 +360,8 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
     // ---- 7. confirmation: steady since the last movement for HCS_CONFIRM_MS, or wanted twice that far apart.
     //         A fill wanted on a steady reading is remembered (oweCand) in case the car drives off first.
     const uint32_t steadyLeft = steadyRemaining();
+    float pdef[NC];
+    const bool planeOk = planeDeficit(hm, pdef);
     for (int i = 0; i < NC; i++)
     {
         Corner &k = c[i];
@@ -338,8 +371,10 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
             k.wantDir = 0;
             continue;
         }
-        if (dir[i] > 0 && steadyLeft != 0xFFFFFFFFUL && (HCS_CONFIRM_MS - (steadyLeft < HCS_CONFIRM_MS ? steadyLeft : HCS_CONFIRM_MS)) >= HCS_OWE_MIN_STEADY_MS)
-            k.oweCand = goal[i] - hm[i];
+        if (dir[i] > 0 && planeOk && steadyLeft != 0xFFFFFFFFUL &&
+            (HCS_CONFIRM_MS - (steadyLeft < HCS_CONFIRM_MS ? steadyLeft : HCS_CONFIRM_MS)) >= HCS_OWE_MIN_STEADY_MS)
+            k.oweCand = fminf_(goal[i] - hm[i], pdef[i]); // level-plane part only: on uneven ground the load lands on the
+                                                         // compressed corners, which would over-fill them elsewhere
         if (k.completeCls != Cls::NONE && cls[i] == k.completeCls)
             continue; // a completion was confirmed with the original correction
         if (k.wantDir != dir[i] || k.wantEpisode != episodeId)

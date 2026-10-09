@@ -560,9 +560,13 @@ void Core::tickCorrecting(const Inputs &in, Outputs &out)
                 c[i].liveH = in.c[i].h; // height is not flow-affected (pressure is); a pulling-away car squats
     if (inEpisode || abortRun >= HCS_ABORT_TICKS)
     {
+        float hv[NC], d[NC];
+        for (int i = 0; i < NC; i++)
+            hv[i] = c[i].inBatch ? c[i].liveH : c[i].lastH; // last motion-free readings
+        const bool ok = planeDeficit(hv, d);
         for (int i = 0; i < NC; i++)
             if (c[i].inBatch && c[i].batchDir > 0)
-                c[i].oweCand = c[i].batchGoal - c[i].liveH; // what is still missing, from the last motion-free reading
+                c[i].oweCand = ok ? fminf_(c[i].batchGoal - hv[i], d[i]) : 0; // still missing, level-plane part only
         return abortBatch(out, "motion detected on the watching corners", State::MOTION);
     }
     if (!batchSettling && (now - batchStart) > HCS_BATCH_WATCHDOG_MS)

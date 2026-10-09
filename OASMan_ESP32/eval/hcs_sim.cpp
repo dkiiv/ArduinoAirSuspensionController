@@ -74,6 +74,7 @@ struct Sim
     float m[4] = {1, 1, 1, 1};
     float extraF[4] = {0, 0, 0, 0}; // people / cargo at that corner, fraction of a corner's static load
     float warp = 0;                 // ground warp (height %): FP+RD ground raised, FD+RP lowered (the hill spot crown)
+    float ground[4] = {0, 0, 0, 0}; // extra ground height under each wheel (height %), for asymmetric spots
     float roll = 0, pitch = 0;      // lateral / longitudinal load transfer, fraction of total weight
     float heave = 0;                // vertical load factor - 1 (bottom of a dip / hill at speed: +0.3 = 1.3 g)
     float bz = 50, bp = 0, br = 0;  // body heave / pitch / roll (solved)
@@ -157,7 +158,7 @@ struct Sim
             for (int i = 0; i < 4; i++)
             {
                 float zc = bz + bp * PX[i] + br * PY[i];
-                float L = zc - warp * WARP[i];
+                float L = zc - warp * WARP[i] - ground[i];
                 float f, d;
                 cornerForce(i, L, zc, f, d);
                 float sv[3] = {1, PX[i], PY[i]};
@@ -197,7 +198,7 @@ struct Sim
         }
         for (int i = 0; i < 4; i++)
         {
-            float L = bz + bp * PX[i] + br * PY[i] - warp * WARP[i];
+            float L = bz + bp * PX[i] + br * PY[i] - warp * WARP[i] - ground[i];
             float La = L < 0 ? 0 : (L > 100 ? 100 : L);
             h[i] = La;
             p[i] = pAir(i, La); // a hanging wheel's bag sits at full extension
@@ -1024,6 +1025,88 @@ static void scenarioGetInAndDrive()
     }
 }
 
+// The owner's real hill spot (screen readings on the stock tesla branch): FD / RP 80-100 %, FP 30-35 %, RD 15-20 %.
+// Twist ~ -33 %: one hanging wheel is (nearly) unloaded and both compressed corners sit below min ride (35 here).
+static void parkSevere(Sim &s)
+{
+    s.drive(8, 0.3f, false);
+    s.run(8, [](Sim &x) { x.warp += 33.0f / 80; x.pitch -= 0.22f / 80; });
+}
+static void leaveSevere(Sim &s)
+{
+    s.run(4, [](Sim &x) { x.warp -= 33.0f / 40; x.pitch += 0.22f / 40; });
+}
+
+static void scenarioSevereSpot()
+{
+    printf("\nS19 the owner's severe hill spot (twist ~-33 %%, compressed corners below min ride): park, night, load, leave\n");
+    const char *names[3] = {"leave, arrive on flat ground", "leave, come back to the spot", "load at the spot, nobody drives"};
+    for (int dest = 0; dest < 3; dest++)
+    {
+        Sim s;
+        g_log.clear();
+        parkedAtPreset(s);
+        s.drive(300, 0.6f);
+        parkSevere(s);
+        const int st0 = s.starts, dumps0 = s.dumpsOn[C_FD] + s.dumpsOn[C_RP];
+        s.run(600); // car still on, controller connected, 10 min
+        float arr[4];
+        for (int i = 0; i < 4; i++)
+            arr[i] = s.h[i];
+        if (dest == 0)
+            printf("  arrival FP %.1f RP %.1f FD %.1f RD %.1f (p %.0f %.0f %.0f %.0f)\n", arr[0], arr[1], arr[2], arr[3], s.p[0], s.p[1], s.p[2], s.p[3]);
+        check(s.starts == st0, "S19", fmt("%s: nothing actuated in 10 min at the spot (%d starts)", names[dest], s.starts - st0));
+        // night: car off, RD leaking ~1 %/h of its air
+        s.presence = false;
+        s.leakPerHour[C_RD] = 0.01f;
+        s.run(8 * 3600);
+        s.leakPerHour[C_RD] = 0;
+        // morning, car off: 20 kg in the trunk, a rear passenger behind the driver; then the driver; controller connects
+        s.disturbance(5);
+        s.extraF[C_RP] += 0.06f;
+        s.extraF[C_RD] += 0.06f;
+        s.run(20);
+        s.disturbance(5);
+        s.extraF[C_RD] += 0.14f;
+        s.run(5);
+        s.disturbance(5);
+        s.extraF[C_FD] += 0.16f;
+        s.presence = true;
+        if (dest == 2)
+        {
+            const int stB = s.starts;
+            s.run(300);
+            printf("  %s: %d corrections; FP %.1f RP %.1f FD %.1f RD %.1f (morning before load: RD had leaked from %.1f)\n", names[dest], s.starts - stB,
+                   s.h[0], s.h[1], s.h[2], s.h[3], arr[3]);
+            check(s.dumpsOn[C_FD] + s.dumpsOn[C_RP] == dumps0, "S19", "hanging corners never dumped at the spot");
+            continue;
+        }
+        s.run(8);
+        const int pulses0 = s.pulses;
+        leaveSevere(s);
+        s.drive(900, 0.6f);
+        if (dest == 1)
+            parkSevere(s);
+        else
+            s.drive(8, 0.3f, false);
+        s.run(300);
+        const float wp = 0.25f * (s.h[C_FP] + s.h[C_RD] - s.h[C_FD] - s.h[C_RP]);
+        printf("  %s: drive pulses %d (FP %d RP %d FD %d RD %d); after arrival FP %.1f RP %.1f FD %.1f RD %.1f (twist %+.1f)\n", names[dest],
+               s.pulses - pulses0, s.pulsesOn[C_FP], s.pulsesOn[C_RP], s.pulsesOn[C_FD], s.pulsesOn[C_RD], s.h[0], s.h[1], s.h[2], s.h[3], wp);
+        check(s.dumpsOn[C_FD] + s.dumpsOn[C_RP] == dumps0, "S19", fmt("%s: hanging corners never dumped", names[dest]));
+        if (dest == 0)
+        {
+            const float sg[4] = {+1, -1, -1, +1};
+            float worst = 0;
+            for (int i = 0; i < 4; i++)
+                worst = fmaxf(worst, fabsf(s.h[i] - sg[i] * wp - 50));
+            check(worst <= HCS_DEADBAND_H + 0.5f, "S19", fmt("flat: level to the preset (worst %.1f)", worst));
+        }
+        else
+            check(fabsf(wp) > 25.0f, "S19", fmt("back at the spot: its twist is left alone (%.1f)", wp));
+    }
+}
+
 int main(int argc, char **argv)
 {
     // usage: hcs_sim [-v] [S<n> ...]   (-v = print the HCS decision log; S<n> = run only those scenarios)
@@ -1044,7 +1127,8 @@ int main(int argc, char **argv)
                      {"S9", scenarioManual},     {"S10", scenarioFastLeak},   {"S11", scenarioLowPreset},   {"S11b", scenarioShowMode},
                      {"S13", scenarioCoupling},  {"S14", scenarioOwnersLeak}, {"S15", scenarioRoadTrip},    {"S16", scenarioDips},
                      {"S17", scenarioShadow},
-                     {"S18", scenarioGetInAndDrive}};
+                     {"S18", scenarioGetInAndDrive},
+                     {"S19", scenarioSevereSpot}};
     for (const auto &sc : all)
     {
         bool run = only.empty();

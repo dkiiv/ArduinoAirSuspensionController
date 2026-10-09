@@ -249,6 +249,11 @@ void Core::motionDetect(const Inputs &in, uint32_t dt)
                 }
                 k.oweCand = 0;
             }
+            if (externalFreeze)
+            {
+                externalFreeze = false; // a car on a jack / lift is not driving (an unloaded wheel was uneven ground)
+                logf("EXTERNAL cleared: driving");
+            }
             oweAt = driveLoadAt = now;
             driveLoadDone = false;
             driveLoadCnt = 0;
@@ -262,6 +267,12 @@ void Core::motionDetect(const Inputs &in, uint32_t dt)
         inEpisode = false;
         logf("MOTION end ep=%lu after %lus (%s)", (unsigned long)episodeId, (unsigned long)((lastMotion - episodeStart) / 1000),
              driving ? "drive" : "disturbance");
+        if (driving && sdN >= HCS_DRIVE_LOAD_MIN_MS / HCS_TICK_MS)
+        {
+            for (int i = 0; i < NC; i++)
+                c[i].pRoad = c[i].sdP / sdN; // what the bags carried on the road this trip
+            roadValid = true;
+        }
         driving = false;
         needEval = true;
     }
