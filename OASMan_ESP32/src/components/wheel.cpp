@@ -170,10 +170,19 @@ bool Wheel::initPressureGoal(int newPressure, bool onlyAirUp, std::function<void
 
 bool Wheel::initAutonomousGoal(int target, int8_t dir, float ceilH, float floorH, float ceilP)
 {
+    // bounds must be in place before startGoal raises the flag the wheel task polls
     this->autoCeilH = ceilH;
     this->autoFloorH = floorH;
     this->autoCeilP = ceilP;
-    return this->startGoal(target, dir > 0, dir < 0, true, nullptr);
+    if (this->startGoal(target, dir > 0, dir < 0, true, nullptr))
+    {
+        return true;
+    }
+    // refused: leave no autonomous state behind (bounds are only read while autonomous && a routine runs)
+    this->autoCeilH = 100.0f;
+    this->autoFloorH = 0.0f;
+    this->autoCeilP = MAX_PRESSURE_SAFETY;
+    return false;
 }
 
 void Wheel::requestAutonomousAbort()

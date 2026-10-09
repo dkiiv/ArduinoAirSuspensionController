@@ -1,7 +1,7 @@
-// Height Control Supervisor -- ESP32 adapter. The decision logic lives in hcs_core.cpp (platform independent,
-// replayed on a PC by eval/hcs_sim.cpp); this file only moves data between it and the hardware:
-//   sensors (cached by the wheel tasks) -> hcs::Inputs -> Core::tick -> START / ABORT -> Wheel goal routines
-// Design: OASMan_ESP32/docs/height-control-supervisor.md
+// Height Control Supervisor -- ESP32 adapter. The decisions live in hcs_*.cpp (platform independent, replayed on a
+// PC by eval/hcs_sim.cpp); this file only moves data between them and the hardware:
+//   wheel tasks' cached readings -> hcs::Inputs -> Core::tick (every 100 ms) -> START / ABORT / PULSE -> Wheel
+// Docs: OASMan_ESP32/docs/height-control-supervisor.md
 
 #include "heightControlSupervisor.h"
 
@@ -9,6 +9,7 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
+#include <stdarg.h>
 #include "hcs_core.h"
 #include "../airSuspensionUtil.h"
 #include "../manifoldSaveData.h"
@@ -65,13 +66,9 @@ static bool loadPersist(hcs::PersistBlob &b)
     {
         return false; // namespace not created yet (first boot with HCS)
     }
-    bool ok = false;
-    if (pr.getBytesLength(HCS_NVS_KEY) == sizeof(b))
-    {
-        ok = pr.getBytes(HCS_NVS_KEY, &b, sizeof(b)) == sizeof(b);
-    }
+    bool ok = pr.getBytesLength(HCS_NVS_KEY) == sizeof(b) && pr.getBytes(HCS_NVS_KEY, &b, sizeof(b)) == sizeof(b);
     pr.end();
-    return ok;
+    return ok; // magic / version / ranges are checked by Core::begin
 }
 
 static void savePersist()
@@ -111,81 +108,77 @@ static void buildInputs(hcs::Inputs &in)
         c.calMaxRaw = getheightCalMax(i);
         c.minRide = getheightCalMinRide(i);
     }
-    in.tank = getCompressor()->getTankPressure();
-    in.tankValid = true; // range-checked inside the core
-    in.compressorOn = getCompressor()->isOn();
-    in.presence = isVehicleOn(); // BT-ignition builds: an authenticated BLE client is connected
+    in.tank = getCompressor()->getTankPressure(); // range-checked in Core::ingest (invalid -> no fills)
+    in.presence = isVehicleOn();                  // BT-ignition builds: an authenticated BLE client is connected
     in.enabled = getheightSensorMode() && getmaintainPressure();
     in.safetyMode = getsafetyMode();
-    float bagMax = (float)getbagMaxPressure();
+    const float bagMax = (float)getbagMaxPressure();
     in.bagCeilPsi = bagMax < (float)MAX_PRESSURE_SAFETY ? bagMax : (float)MAX_PRESSURE_SAFETY;
     in.compressorOffPsi = (float)getcompressorOffPSI();
 }
 
 static void applyOutputs(const hcs::Outputs &out)
 {
-    if (out.cmd == hcs::Cmd::START)
+    for (int i = 0; i < hcs::NC; i++)
     {
-        for (int i = 0; i < hcs::NC; i++)
+        const hcs::GoalRequest &g = out.g[i];
+        if (!g.active)
         {
-            const hcs::GoalRequest &g = out.g[i];
-            if (!g.active)
-            {
-                continue;
-            }
-            bool ok = getWheel(i)->initAutonomousGoal(g.target, g.dir, g.ceilH, g.floorH, g.ceilP);
-            if (!ok)
-            {
-                Serial.printf("HCS wheel %d refused goal %d\n", i, g.target);
-            }
+            continue;
         }
-    }
-    else if (out.cmd == hcs::Cmd::ABORT)
-    {
-        for (int i = 0; i < hcs::NC; i++)
+        Wheel *w = getWheel(i);
+        if (out.cmd == hcs::Cmd::START && !w->initAutonomousGoal(g.target, g.dir, g.ceilH, g.floorH, g.ceilP))
         {
-            if (out.g[i].active)
-            {
-                getWheel(i)->endAutonomousPulse();
-                getWheel(i)->requestAutonomousAbort();
-            }
+            Serial.printf("HCS wheel %d refused goal %d\n", i, g.target);
         }
-    }
-    else if (out.cmd == hcs::Cmd::PULSE)
-    {
-        for (int i = 0; i < hcs::NC; i++)
+        else if (out.cmd == hcs::Cmd::ABORT)
         {
-            const hcs::GoalRequest &g = out.g[i];
-            if (g.active && g.dir > 0 && !getWheel(i)->startAutonomousPulse(g.pulseMs, g.ceilP))
-            {
-                Serial.printf("HCS wheel %d refused cruise pulse\n", i);
-            }
+            w->endAutonomousPulse();
+            w->requestAutonomousAbort();
+        }
+        else if (out.cmd == hcs::Cmd::PULSE && g.dir > 0 && !w->startAutonomousPulse(g.pulseMs, g.ceilP))
+        {
+            Serial.printf("HCS wheel %d refused cruise pulse\n", i);
         }
     }
 }
 
 #if HCS_DIAG_DUMP
+static void appendf(char *buf, size_t n, size_t &w, const char *fmt, ...)
+{
+    if (w + 1 >= n)
+    {
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    const int r = vsnprintf(buf + w, n - w, fmt, ap);
+    va_end(ap);
+    w = r < 0 ? n - 1 : (w + (size_t)r >= n ? n - 1 : w + (size_t)r);
+}
+
 static void diagDump()
 {
     static char buf[720];
     core.dump(buf, sizeof(buf));
     Serial.println(buf);
-    // Raw electrical view (what the reverted manifold_v4_diag used to print): pre-calibration, UNclamped.
-    // >100 or <0 = voltage outside 0.5-4.5 V at the ADC pin (floating input / lost ground) -- electrical.
+    // Raw electrical view: pre-calibration, UNclamped. <0 or >100 = voltage outside 0.5-4.5 V at the ADC pin.
     static const char *const cn[4] = {"FP", "RP", "FD", "RD"};
-    int w = snprintf(buf, sizeof(buf), "HRAW");
+    size_t w = 0;
+    buf[0] = 0;
+    appendf(buf, sizeof(buf), w, "HRAW");
     for (int i = 0; i < 4; i++)
     {
-        float raw = getWheel(i)->getLevelRaw();
-        w += snprintf(buf + w, sizeof(buf) - w, " %s=%.1f(%.2fV)", cn[i], raw, 0.5f + raw * 0.04f);
+        const float raw = getWheel(i)->getLevelRaw();
+        appendf(buf, sizeof(buf), w, " %s=%.1f(%.2fV)", cn[i], raw, 0.5f + raw * 0.04f);
     }
-    w += snprintf(buf + w, sizeof(buf) - w, " CAL");
+    appendf(buf, sizeof(buf), w, " CAL");
     for (int i = 0; i < 4; i++)
     {
-        w += snprintf(buf + w, sizeof(buf) - w, " %s[%.1f..%.1f mr%.1f]", cn[i], getheightCalMin(i), getheightCalMax(i), getheightCalMinRide(i));
+        appendf(buf, sizeof(buf), w, " %s[%.1f..%.1f mr%.1f]", cn[i], getheightCalMin(i), getheightCalMax(i), getheightCalMinRide(i));
     }
-    snprintf(buf + w, sizeof(buf) - w, " HM=%d MP=%d BLE=%d comp=%d", getheightSensorMode() ? 1 : 0, getmaintainPressure() ? 1 : 0,
-             isVehicleOn() ? 1 : 0, getCompressor()->isOn() ? 1 : 0);
+    appendf(buf, sizeof(buf), w, " HM=%d MP=%d BLE=%d comp=%d", getheightSensorMode() ? 1 : 0, getmaintainPressure() ? 1 : 0,
+            isVehicleOn() ? 1 : 0, getCompressor()->isOn() ? 1 : 0);
     Serial.println(buf);
 }
 #endif
@@ -193,7 +186,7 @@ static void diagDump()
 static void task_hcs(void *)
 {
     hcs::PersistBlob blob;
-    bool have = loadPersist(blob);
+    const bool have = loadPersist(blob);
     core.begin(millis(), have ? &blob : nullptr, HCS_SHADOW_MODE, hcsLog);
     Serial.printf("HCS supervisor started (%s%s)\n", HCS_SHADOW_MODE ? "SHADOW: log only, legacy maintain active" : "ACTIVE",
                   HCS_DIAG_DUMP ? ", diag dump" : "");
@@ -208,12 +201,11 @@ static void task_hcs(void *)
         p = evPreset;
         m = evManual;
         memcpy(ph, evPresetH, sizeof(ph));
-        evPreset = false;
-        evManual = false;
+        evPreset = evManual = false;
         portEXIT_CRITICAL(&hcsMux);
         if (p)
         {
-            core.notifyPresetLoad(ph);
+            core.notifyPresetLoad(ph); // also counts as the manual event, so a same-tick evManual is not lost
         }
         else if (m)
         {

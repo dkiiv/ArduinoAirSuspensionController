@@ -1,13 +1,14 @@
-// PC scenario simulator for the Height Control Supervisor. Never compiled into firmware.
+// PC bench simulator for the Height Control Supervisor. Never compiled into firmware.
+// Docs: OASMan_ESP32/docs/hcs-simulator.md
 //
-// Compiles the PRODUCTION supervisor core (src/heightControl/hcs_core.cpp) against a crude quasi-static
-// air-spring plant and replays the scenarios from docs/height-control-supervisor.md, asserting the safety
-// properties (R1-R6). It tests the DECISION LOGIC, not the physics: the plant, the noise levels and the road
-// model are assumptions, so thresholds that pass here still have to be confirmed with the diag build on the car.
+// Compiles the PRODUCTION supervisor sources (src/heightControl/hcs_*.cpp) against a simulated car and replays
+// scenarios, asserting what must (not) happen. It tests the DECISION LOGIC; the plant, noise and road models are
+// assumptions, so thresholds that pass here still have to be confirmed with the shadow build on the car.
 //
-// Build & run (from this directory):
-//   g++ -std=c++17 -O2 -Wall -o hcs_sim hcs_sim.cpp && ./hcs_sim          (summary)
-//   ./hcs_sim -v                                                          (with the full HCS decision log)
+// Build & run (from OASMan_ESP32/):
+//   g++ -std=c++17 -O2 -Wall -Wextra -o hcs_sim eval/hcs_sim.cpp && ./hcs_sim     (summary)
+//   ./hcs_sim -v                                                                    (+ the full HCS decision log)
+//   ./hcs_sim -v S16                                                                (one scenario)
 //
 // Plant model: a RIGID BODY (heave z, pitch, roll) on four isothermal air springs, solved for static
 // equilibrium every 100 ms (Newton, 3 unknowns).
@@ -22,6 +23,9 @@
 
 #define HCS_HOST_BUILD
 #include "../src/heightControl/hcs_core.cpp"
+#include "../src/heightControl/hcs_sense.cpp"
+#include "../src/heightControl/hcs_classify.cpp"
+#include "../src/heightControl/hcs_cruise.cpp"
 
 #include <cmath>
 #include <cstdio>
@@ -43,7 +47,6 @@ static void logSink(const char *line)
         printf("    %s\n", line);
 }
 
-static const char *const NAMES[4] = {"FP", "RP", "FD", "RD"};
 // load-transfer sign vectors in FP, RP, FD, RD order (passenger = right side, US)
 static const float WARP[4] = {+1, -1, -1, +1};  // FP+RD loaded, FD+RP unloaded (the owner's hill spot)
 static const float ROLL[4] = {+1, +1, -1, -1};  // load onto the passenger side (left-hand turn)
@@ -72,6 +75,7 @@ struct Sim
     float extraF[4] = {0, 0, 0, 0}; // people / cargo at that corner, fraction of a corner's static load
     float warp = 0;                 // ground warp (height %): FP+RD ground raised, FD+RP lowered (the hill spot crown)
     float roll = 0, pitch = 0;      // lateral / longitudinal load transfer, fraction of total weight
+    float heave = 0;                // vertical load factor - 1 (bottom of a dip / hill at speed: +0.3 = 1.3 g)
     float bz = 50, bp = 0, br = 0;  // body heave / pitch / roll (solved)
     float T = 1.0f;
     float leakPerHour[4] = {0, 0, 0, 0}; // fraction of air mass per hour
@@ -79,13 +83,13 @@ struct Sim
     float tank = 170;
     bool compOn = false;
     bool presence = true;
+    bool shadow = false; // boot the supervisor in shadow mode (decide + log, never actuate)
     bool enabled = true;
     float rough = 0;  // road roughness (0 = parked)
     bool moving = false;
     float bounceT = 0;
     float rawFault[4] = {NAN, NAN, NAN, NAN}; // forced raw height (wire break)
     bool manualIn[4] = {false, false, false, false};
-    int valveTo[4] = {0, 1, 2, 3}; // physical corner whose bag the logical corner's valves actually feed
     Routine r[4];
     uint32_t pulseUntil[4] = {0, 0, 0, 0};
     uint32_t seq = 0;
@@ -108,7 +112,7 @@ struct Sim
 
     void boot(bool restore)
     {
-        core.begin(t, (restore && haveBlob) ? &blob : nullptr, false, logSink);
+        core.begin(t, (restore && haveBlob) ? &blob : nullptr, shadow, logSink);
         for (auto &x : r)
             x = Routine();
     }
@@ -140,7 +144,7 @@ struct Sim
     void solve()
     {
         static const float PX[4] = {+1, -1, +1, -1}, PY[4] = {+1, +1, -1, -1};
-        float W = 400, Mx = 400 * pitch, My = 400 * roll;
+        float W = 400 * (1 + heave), Mx = 400 * pitch, My = 400 * roll;
         for (int i = 0; i < 4; i++)
         {
             W += 100 * extraF[i];
@@ -245,7 +249,7 @@ struct Sim
                 else
                     outOpen = true;
             }
-            const int v = valveTo[i];
+            const int v = i;
             if (inOpen && tank > p[v])
             {
                 float dm = 0.083f * (tank - p[v]) / 100.0f * dt;
@@ -302,8 +306,6 @@ struct Sim
                 maxH[i] = h[i];
         }
         in.tank = tank + 0.3f * N(rng);
-        in.tankValid = true;
-        in.compressorOn = compOn;
         in.presence = presence;
         in.enabled = enabled;
         in.safetyMode = false;
@@ -676,7 +678,7 @@ static void scenarioFaults()
     s.rawFault[C_RD] = 112; // floating input drifts high
     s.leakPerHour[C_RD] = 0.2f;
     s.run(1800);
-    check(countLog("FAULT RD height out of") == 1, "S7", "RD wire break latched");
+    check(countLog("FAULT RD height sensor") == 1, "S7", "RD wire break latched");
     check(s.fillsOn[C_RD] == 0 && s.dumpsOn[C_RD] == 0, "S7", "faulted corner never actuated (no blind actuation)");
     s.rawFault[C_FP] = -8;
     s.leakPerHour[C_RP] = 0.2f;
@@ -789,7 +791,7 @@ static void scenarioShowMode()
     check(countLog("FAULT") == 0, "S11b", "no false sensor fault on empty bags");
 }
 
-// Strong body coupling with CORRECT wiring must never trip the mapping guard
+// Rigid-body coupling: a fill on one corner moves the other three; only the leaking corner may be actuated
 static void scenarioCoupling()
 {
     printf("\nS13 rigid-body coupling: every fill moves the neighbours too (correct wiring)\n");
@@ -804,7 +806,6 @@ static void scenarioCoupling()
     s.extraF[C_RD] += 0.05f;
     s.run(900);
     printf("  starts=%d, final FP=%.1f RP=%.1f FD=%.1f RD=%.1f\n", s.starts, s.h[0], s.h[1], s.h[2], s.h[3]);
-    check(countLog("MAPPING") == 0, "S13", "no mapping fault from normal neighbour movement");
     check(s.starts >= 1 && s.core.state() != State::FAULT, "S13", fmt("corrections kept working (%d batches)", s.starts));
     float worst = 0;
     for (int i = 0; i < 4; i++)
@@ -880,44 +881,105 @@ static void scenarioRoadTrip()
     check(countLog("FAST leak latched") == 0, "S15", "slow leak not latched");
 }
 
-// Valve / sensor corner mapping mismatch (e.g. a pin reorder applied to valves but not to height channels)
-static void scenarioMapping()
+// Dips / the bottom of a hill at speed: all four corners compress and every bag pressure rises together.
+// Must never be filled. Then real weight is added after parking: must still be compensated.
+static void scenarioDips()
 {
-    printf("\nS12 RP/RD valves cross-wired relative to the height sensors\n");
+    printf("\nS16 dips / bottom of hills at speed (all 4 compress, pressures up), then real load after parking\n");
+    // case 0: normal road texture, sharp dips (0.35 g for 3 s, every 4th one 8 s)
+    // case 1: glassy road (no texture at all), same dips: the detector only sees the dips themselves
+    // case 2: glassy road, long gentle highway sag curves (0.12 g over 9 s): the detector sees NOTHING, the car looks
+    //         parked, evaluations run -- only the confirmation rule (same correction wanted twice >= 10 s apart,
+    //         no motion in between) stands between a sag and a fill.
+    static const char *const NAME[3] = {"normal road, sharp dips", "glassy road, sharp dips", "glassy road, long sags"};
+    for (int cs = 0; cs < 3; cs++)
+    {
+        Sim s;
+        g_log.clear();
+        parkedAtPreset(s);
+        s.moving = true;
+        s.rough = cs == 0 ? 0.35f : 0.0f;
+        float t0 = 0, minH = 100;
+        s.run(900, [&](Sim &x) {
+            t0 += 0.1f;
+            const float ph = fmodf(t0, 45.0f);
+            const float dur = cs == 2 ? 9.0f : ((fmodf(t0, 180.0f) < 45.0f) ? 8.0f : 3.0f);
+            const float g = cs == 2 ? 0.12f : 0.35f;
+            x.heave = (ph < dur) ? g * 0.5f * (1 - cosf(2 * 3.14159f * ph / dur)) : 0.0f;
+            for (int i = 0; i < 4; i++)
+                minH = fminf(minH, x.h[i]);
+        });
+        s.heave = 0;
+        s.rough = 0;
+        s.moving = false;
+        const int wanted = countLog("wanted, confirming");
+        printf("  %s: deepest compression %.1f%% (preset 50), DRIVING confirmed %d, corrections held for confirmation %d\n", NAME[cs],
+               minH, countLog("DRIVING confirmed"), wanted);
+        check(s.startsWhileMoving == 0 && s.valveMsWhileMoving == 0 && s.pulses == 0, "S16",
+              fmt("%s: no fill / dump / pulse in 15 min", NAME[cs]));
+        if (cs == 2)
+            check(wanted > 0, "S16", "long sags: the confirmation rule was exercised (an evaluation saw the sag) and held");
+        if (cs != 0)
+            continue;
+        // parked now: two adults into the rear seats
+        s.run(180);
+        const int st0 = s.starts;
+        s.disturbance(8);
+        s.extraF[C_RP] += 0.18f;
+        s.extraF[C_RD] += 0.18f;
+        s.run(150);
+        check(s.starts > st0 && fabsf(s.h[C_RP] - 50) <= HCS_DEADBAND_H && fabsf(s.h[C_RD] - 50) <= HCS_DEADBAND_H, "S16",
+              fmt("weight added after parking is still compensated (RP %.1f RD %.1f)", s.h[C_RP], s.h[C_RD]));
+    }
+}
+
+// Shadow build (the first thing flashed on a car): decides and logs, must never actuate or latch anything.
+static void scenarioShadow()
+{
+    printf("\nS17 shadow build: leak + load for 2 h, phone connected -> logs SHADOW decisions, never actuates\n");
     Sim s;
     g_log.clear();
+    s.shadow = true;
     parkedAtPreset(s);
-    s.valveTo[C_RP] = C_RD;
-    s.valveTo[C_RD] = C_RP;
-    s.leakPerHour[C_RP] = 0.10f;
-    s.run(3 * 3600);
-    printf("  starts=%d, RD max=%.1f\n", s.starts, s.maxH[C_RD]);
-    check(countLog("FAULT MAPPING") == 1, "S12", "mismatch detected after the first batch");
-    check(s.starts == 1, "S12", "exactly one batch ran before the global freeze");
-    check(s.maxH[C_RD] < 50 + HCS_MAPPING_LIVE_DH + 2.0f, "S12", fmt("live check stopped the wrong-corner fill early (RD max %.1f)", s.maxH[C_RD]));
-    check(s.core.state() == State::FAULT, "S12", "supervisor stays frozen");
+    s.leakPerHour[C_RD] = 0.10f;
+    s.run(1800);
+    s.disturbance(6);
+    s.extraF[C_RP] += 0.18f;
+    s.run(5400);
+    printf("  SHADOW would START lines: %d, starts=%d, RD now %.1f\n", countLog("SHADOW would START"), s.starts, s.h[C_RD]);
+    check(s.starts == 0 && s.pulses == 0, "S17", "no actuation at all");
+    check(countLog("SHADOW would START") > 0, "S17", "the decisions it would have taken are logged");
+    check(countLog("FAST leak latched") == 0 && countLog("LEAK RD refill") == 0, "S17", "no leak bookkeeping from decisions that never ran");
 }
 
 int main(int argc, char **argv)
 {
-    if (argc > 1 && strcmp(argv[1], "-v") == 0)
-        g_verbose = true;
-    scenarioHill();
-    scenarioDriving();
-    scenarioLeakBelowMin();
-    scenarioLoad();
-    scenarioDriveOffMidFill();
-    scenarioNoPresence();
-    scenarioFaults();
-    scenarioJack();
-    scenarioManual();
-    scenarioFastLeak();
-    scenarioLowPreset();
-    scenarioShowMode();
-    scenarioMapping();
-    scenarioCoupling();
-    scenarioOwnersLeak();
-    scenarioRoadTrip();
+    // usage: hcs_sim [-v] [S<n> ...]   (-v = print the HCS decision log; S<n> = run only those scenarios)
+    std::vector<std::string> only;
+    for (int a = 1; a < argc; a++)
+    {
+        if (strcmp(argv[a], "-v") == 0)
+            g_verbose = true;
+        else
+            only.push_back(argv[a]);
+    }
+    struct
+    {
+        const char *id;
+        void (*fn)();
+    } const all[] = {{"S1", scenarioHill},       {"S2", scenarioDriving},     {"S3", scenarioLeakBelowMin}, {"S4", scenarioLoad},
+                     {"S5", scenarioDriveOffMidFill}, {"S6", scenarioNoPresence}, {"S7", scenarioFaults},  {"S8", scenarioJack},
+                     {"S9", scenarioManual},     {"S10", scenarioFastLeak},   {"S11", scenarioLowPreset},   {"S11b", scenarioShowMode},
+                     {"S13", scenarioCoupling},  {"S14", scenarioOwnersLeak}, {"S15", scenarioRoadTrip},    {"S16", scenarioDips},
+                     {"S17", scenarioShadow}};
+    for (const auto &sc : all)
+    {
+        bool run = only.empty();
+        for (const auto &o : only)
+            run = run || o == sc.id;
+        if (run)
+            sc.fn();
+    }
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

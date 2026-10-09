@@ -9,7 +9,6 @@
 #include <Wire.h>
 #include <SPI.h>
 #include "manifoldSaveData.h"
-#include "../heightControl/hcs_config.h"
 
 #define PRESSURE_AVERAGE_ARRAY_SIZE 5
 #define FREEZE_TIME_CHECK_MS 15 * 1000 // 15 seconds
@@ -27,7 +26,6 @@ private:
     unsigned long lastFreezeTime;
     unsigned long pauseExecutionUntilTime;
     unsigned long accessoryOnTime; // millis() when accessory power was first seen (0 = not seen yet / acc currently off)
-    unsigned long runStartTime = 0; // HCS builds: start of the current continuous compressor run (0 = off)
     Solenoid s_trigger; // Not a solenoid, but works the same way
 public:
     Compressor();

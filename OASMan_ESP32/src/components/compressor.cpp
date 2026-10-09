@@ -143,31 +143,6 @@ void Compressor::loop()
         return;
     }
 
-#if HEIGHT_CONTROL_SUPERVISOR
-    // Bounded continuous run time + cooldown (HCS builds). A leak or a big correction must not cook the compressor.
-    // Reuses the existing freeze pause, so the app's COMPRESSOR_FROZEN status shows it; no protocol change. A
-    // user's manual compressor command (enableDisableOverride) still clears the pause: the user wins.
-    if (this->s_trigger.isOpen())
-    {
-        if (this->runStartTime == 0)
-        {
-            this->runStartTime = curTime == 0 ? 1 : curTime;
-        }
-        if (curTime - this->runStartTime >= (unsigned long)HCS_COMPRESSOR_MAX_RUN_MS)
-        {
-            Serial.println("HCS compressor: max continuous run reached -> cooldown");
-            this->pauseExecutionUntilTime = curTime + HCS_COMPRESSOR_COOLDOWN_MS;
-            this->runStartTime = 0;
-            this->s_trigger.close();
-            return;
-        }
-    }
-    else
-    {
-        this->runStartTime = 0;
-    }
-#endif
-
     // if compressor is on, check if it is frozen by checking every 15 seconds or so the value, and if the change is less than 3psi then tell the compressor to pause for a bit. if compressor is not running, continually update last read time and pressure.
     if (this->s_trigger.isOpen() && !isAnyWheelActive())
     {
