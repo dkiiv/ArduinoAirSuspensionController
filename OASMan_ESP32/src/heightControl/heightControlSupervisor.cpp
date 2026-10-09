@@ -9,7 +9,6 @@
 
 #include <Arduino.h>
 #include <preferencable.h> // writeBytes / readBytes: the same SPIFFS store the pressure AI keeps its samples in
-#include <stdarg.h>
 #include "hcs_core.h"
 #include "../airSuspensionUtil.h"
 #include "../manifoldSaveData.h"
@@ -20,8 +19,8 @@ static volatile bool evPreset = false;
 static volatile bool evManual = false;
 static uint8_t evPresetH[hcs::NC];
 
-// Targets, references and learned values (fill rate, leak rate, last-trip road pressures). Kept forever, like the AI
-// samples: survives reboots and power loss; rejected only if its magic / version / ranges are wrong (Core::begin).
+// Targets, references and learned fill rates. Kept forever, like the AI samples: survives reboots and power loss;
+// rejected only if its magic / version / ranges are wrong (Core::begin).
 static const char *const HCS_STATE_FILE = "/hcsState.bin";
 
 bool hcsOwnsHeightMaintain()
@@ -129,25 +128,12 @@ static void applyOutputs(const hcs::Outputs &out)
         }
         else if (out.cmd == hcs::Cmd::PULSE && g.dir > 0 && !w->startAutonomousPulse(g.pulseMs, g.ceilP))
         {
-            Serial.printf("HCS wheel %d refused cruise pulse\n", i);
+            Serial.printf("HCS wheel %d refused pulse\n", i);
         }
     }
 }
 
 #if HCS_DIAG_DUMP
-static void appendf(char *buf, size_t n, size_t &w, const char *fmt, ...)
-{
-    if (w + 1 >= n)
-    {
-        return;
-    }
-    va_list ap;
-    va_start(ap, fmt);
-    const int r = vsnprintf(buf + w, n - w, fmt, ap);
-    va_end(ap);
-    w = r < 0 ? n - 1 : (w + (size_t)r >= n ? n - 1 : w + (size_t)r);
-}
-
 static void diagDump()
 {
     static char buf[720];
@@ -157,18 +143,18 @@ static void diagDump()
     static const char *const cn[4] = {"FP", "RP", "FD", "RD"};
     size_t w = 0;
     buf[0] = 0;
-    appendf(buf, sizeof(buf), w, "HRAW");
+    hcs::appendf(buf, sizeof(buf), w, "HRAW");
     for (int i = 0; i < 4; i++)
     {
         const float raw = getWheel(i)->getLevelRaw();
-        appendf(buf, sizeof(buf), w, " %s=%.1f(%.2fV)", cn[i], raw, 0.5f + raw * 0.04f);
+        hcs::appendf(buf, sizeof(buf), w, " %s=%.1f(%.2fV)", cn[i], raw, 0.5f + raw * 0.04f);
     }
-    appendf(buf, sizeof(buf), w, " CAL");
+    hcs::appendf(buf, sizeof(buf), w, " CAL");
     for (int i = 0; i < 4; i++)
     {
-        appendf(buf, sizeof(buf), w, " %s[%.1f..%.1f mr%.1f]", cn[i], getheightCalMin(i), getheightCalMax(i), getheightCalMinRide(i));
+        hcs::appendf(buf, sizeof(buf), w, " %s[%.1f..%.1f mr%.1f]", cn[i], getheightCalMin(i), getheightCalMax(i), getheightCalMinRide(i));
     }
-    appendf(buf, sizeof(buf), w, " HM=%d MP=%d BLE=%d comp=%d", getheightSensorMode() ? 1 : 0, getmaintainPressure() ? 1 : 0,
+    hcs::appendf(buf, sizeof(buf), w, " HM=%d MP=%d BLE=%d comp=%d", getheightSensorMode() ? 1 : 0, getmaintainPressure() ? 1 : 0,
             isVehicleOn() ? 1 : 0, getCompressor()->isOn() ? 1 : 0);
     Serial.println(buf);
 }

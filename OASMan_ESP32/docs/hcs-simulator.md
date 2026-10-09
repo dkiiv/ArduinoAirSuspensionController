@@ -1,134 +1,88 @@
 # HCS bench simulator
 
-`eval/hcs_sim.cpp` runs the **production** Height Control Supervisor sources (`src/heightControl/hcs_*.cpp`, unmodified) against a simulated car on a PC, replays scenarios, and checks what must and must not happen.
-
-Use it to:
-- check a change to the supervisor before it goes near the car;
-- reproduce an edge case you saw in a field log;
-- see what a threshold change does across all scenarios.
-
-It tests the **decision logic**. The car model, noise and road are assumptions, so a threshold that passes here still has to be confirmed on the car ([hcs-field-data.md](hcs-field-data.md)).
+`eval/hcs_sim.cpp` runs the **production** supervisor sources (`src/heightControl/hcs_*.cpp`, unmodified) against a simulated car on a PC, replays scenarios, and checks what must and must not happen. It tests the **decision logic**; the car model, noise and road are assumptions, so thresholds still have to be confirmed on the car ([hcs-field-data.md](hcs-field-data.md)).
 
 ## Build and run
 
-From `OASMan_ESP32/` (any C++17 compiler; no Arduino, no PlatformIO):
+From `OASMan_ESP32/` (any C++17 compiler):
 
 ```
 g++ -std=c++17 -O2 -Wall -Wextra -o hcs_sim eval/hcs_sim.cpp
-./hcs_sim              # all scenarios, PASS/FAIL per check, exit code 1 if anything failed
-./hcs_sim S3 S16       # only those scenarios
-./hcs_sim -v S1        # plus the full HCS decision log (same "HCS t=..." lines the firmware prints)
+./hcs_sim              # all scenarios; exit code 1 if anything failed (~7 s, ~75 simulated hours)
+./hcs_sim S3 S16       # only those
+./hcs_sim -v S1        # plus the full "HCS t=..." decision log
+HCS_DUMP_FROM=790000 HCS_DUMP_TO=800000 ./hcs_sim S1   # HCSD state lines between two sim times (ms)
 ```
 
-**Try a different tunable:** every value in `hcs_config.h` can be overridden with `-D`.
+Every value in `hcs_config.h` can be overridden with `-D`, e.g. `-DHCS_MOTION_H_THRESH=1.0f`.
 
-```
-g++ -std=c++17 -O2 -DHCS_MOTION_H_THRESH=1.0f -DHCS_CONFIRM_MS=0 -o hcs_sim_test eval/hcs_sim.cpp && ./hcs_sim_test
-```
+**What a check is for.** 47 checks over 17 scenarios. Each asserts one behaviour no other check covers, or a precondition that stops a scenario from passing vacuously. Each guarded rule was disabled with a `-D` override to confirm a check fails:
 
-(With `HCS_CONFIRM_MS=0`, S16 fails: that is how the dips rule was shown to be load-bearing.)
-
-**Dump the internal state** between two sim times (ms) with the same `HCSD` line the diag build prints:
-
-```
-HCS_DUMP_FROM=790000 HCS_DUMP_TO=800000 ./hcs_sim S1
-```
-
-Runtime: all scenarios together take about five seconds of wall time and cover ~75 simulated hours.
-
-**What a check is for.** 47 checks over 17 scenarios. Each asserts one behaviour that no other check covers, or a precondition that stops a scenario from passing vacuously (e.g. "the confirmation rule was exercised"). Before keeping a check, break the rule it guards with a `-D` override and confirm the check fails. For example:
-- `-DHCS_CONFIRM_MS=0` fails S16;
-- `-DHCS_OWE_MAX=0.0f` (no drive-away top-up) fails S18 "level while still driving";
-- `-DHCS_URGENT_MAX_AGE_MS=0` fails S19 "lift starts the moment the controller connects";
-- `-DHCS_AUTO_LOWER=false` fails S4 (unload).
+| Override | Fails |
+|---|---|
+| `-DHCS_CONFIRM_MS=0` (no confirmation) | S16 dips |
+| `-DHCS_URGENT_MAX_AGE_MS=0` (no lift at connect) | S19 |
+| `-DHCS_OWE_MAX=0.0f` (no drive pulses) | S15, S18, S19 |
+| `-DHCS_ROAD_HEAVE_MIN=-100.0f` (no "sits low overall" gate) | S2 spiral ramp, S15 |
+| `-DHCS_AUTO_LOWER=false` | S4 unload, S15, S19 |
 
 ## The simulated car
 
 A **rigid body** (heave, pitch, roll) on four air springs, solved for static equilibrium every 100 ms.
 
-- **Air springs.** Isothermal: `p = 100 * m * T * 60 / (h + 10)`, where `m` is the air mass in a bag (1.0 = preset) and `T` the temperature factor. Height is in %, with the preset at 50 and about 100 psi per corner.
-- **Coupling.** Filling one corner moves and re-loads the other three, a ground crown loads one diagonal and unloads the other, and a leak tilts the whole body, as on a real car. No coupling is hand-tuned.
-- **Limits.** Bump stops below 2 %; the wheel leaves the ground past 100 % (jack); a jack can be placed under a corner.
-- **Loads.**
-  - `extraF[i]`: people or cargo at a corner, as a fraction of a corner's static load.
-  - `roll` / `pitch`: cornering or braking load transfer, as a fraction of total weight.
-  - `heave`: vertical g minus 1 (+0.3 = the bottom of a dip at 1.3 g).
-- **Ground.** `warp` is a crown, in height %: FP and RD up, FD and RP down. This is the hill spot. `ground[i]` adds extra ground height under one wheel. Past 100 % a wheel leaves the ground and its bag carries only the wheel (severe crowns hit this, as on the owner's spot).
-- **Air.** `leakPerHour[i]` is the share of a bag's air lost per hour. `T` models heating and cooling.
-- **Compressor.** On below 140 psi and off at 180, **only with a BLE client** (like `compressor.cpp`). It adds 1 psi/s.
-- **Valves.** Flow is proportional to the tank-to-bag difference.
-  - The goal routine is emulated: it stops at the target, the ceiling or the floor, and times out at `HCS_ROUTINE_TIMEOUT_MS`.
-  - Manual valves (`manualIn[i]`) and cruise pulses are modelled too.
-  - **Plant limitation:** a fill with the tank below the bag never pushes air back into the tank here, as it can on a real car (see the tank guard in [height-control-supervisor.md](height-control-supervisor.md)).
-- **Measurement.**
-  - Gaussian noise: 0.15 % on height, 0.25 psi on pressure.
-  - `rough` adds road input: random plus a 1.4 Hz body bounce.
-  - Bag pressure reads high while that corner's IN valve is open (flow offset), as the real sensor does.
-  - `rawFault[i]` forces a raw height reading (wire break).
+- **Air springs**, isothermal: `p = pNom * m * T * 60 / (h + 10)`, `m` = air mass (1.0 = preset), `T` = temperature factor, preset at 50 %. `pNom` is the bag pressure at the preset (default 100; the owner's car ~65). Filling one corner re-loads the other three, a crown loads one diagonal, a leak tilts the whole body; no coupling is hand-tuned.
+- **Limits.** Bump stops below 2 %; past 100 % a wheel leaves the ground and its bag carries only the wheel; a jack can be placed under a corner.
+- **Loads.** `extraF[i]` people / cargo (fraction of a corner's static load); `roll` / `pitch` cornering / braking (fraction of the weight); `heave` vertical g - 1.
+- **Ground.** `warp`: a crown (FP and RD up, FD and RP down). `ground[i]`: extra height under one wheel. `parkSevere()` reproduces the owner's spot.
+- **Air.** `leakPerHour[i]`; `T` for heating / cooling.
+- **Compressor.** On below `tankOn`, off at `tankOff` (default 140 / 180), **only with a BLE client**; +1 psi/s.
+- **Valves.** Flow proportional to tank - bag. The goal routine is emulated (stops at target, ceiling or floor; times out). Manual valves and fill pulses too. A fill with the tank below the bag never pushes air back here, as it could on a car.
+- **Measurement.** Noise 0.15 % height, 0.25 psi; `rough` adds road input (random + 1.4 Hz bounce); bag pressure reads high while its IN valve is open; `rawFault[i]` forces a raw reading (wire break).
 
-**Not modelled:**
-- bag hysteresis, and pressure that lags height on a load change;
-- tyre compliance;
-- adiabatic (fast) compression;
-- real valve flow curves;
-- the AI flow-offset model;
-- the BLE link itself.
-
-Calibration is fixed at raw 10..90 with min ride 35. These are the gaps the field data has to close.
+Not modelled: bag hysteresis, tyre compliance, fast (adiabatic) compression, real valve flow curves, the AI flow-offset model, the BLE link. Calibration is raw 10..90, min ride 35 unless a scenario sets it.
 
 ## Scenarios
 
 | Id | Scenario | Key checks |
 |---|---|---|
-| S1 | hill spot: crown + slope, phone connected 8 h, cooling, slow leak on a hanging corner | arrival: targets rebuilt once (preset plane + crown twist), nothing corrected; hanging corners never dumped; compressed corners never pushed toward flat; leak refilled to the arrival height; no false leak latch |
-| S2 | 30 min mixed driving (sweepers, braking, highway, red lights), plus a blind-detector variant | zero actuation while moving |
-| S3 | overnight leak below min ride, no BLE, reboot at 5 h, owner returns at 8 h; plus a "nothing persisted" variant | nothing moves without BLE; RD lifted back to the preset (BOTTOM_GUARD + completion); driver load also compensated; only RD actuated |
-| S4 | two rear passengers, 10 kg groceries, passengers leave | rear lifted back; front untouched; groceries ignored; lowered back on UNLOAD |
-| S5 | drive off in the middle of a correction | abort within ~500 ms; the unfinished part is owed and topped up while driving |
-| S6 | load with no BLE client, then the client connects | VETO while absent; corrected after |
-| S7 | RD height wire break, then a second sensor | corner frozen; global FAULT with two |
-| S8 | car jacked at RP with the phone connected | EXTERNAL freeze; nothing moves; clears afterwards |
+| S1 | hill spot: crown + slope, connected 8 h, cooling, slow leak on a hanging corner | targets = preset plane + crown twist; hanging corners never dumped; compressed corners never pushed flat; leak refilled; no false latch |
+| S2 | 30 min mixed driving (sweepers, braking, a 3-min spiral ramp, highway, red lights); a blind-detector variant | zero corrections and pulses while moving |
+| S3 | overnight leak below min ride, no BLE, reboot at 5 h, owner returns at 8 h; a "nothing persisted" variant | nothing moves without BLE; RD lifted into the deadband; only RD actuated |
+| S4 | two rear passengers, 10 kg groceries, passengers leave | rear lifted back; front untouched; groceries ignored; lowered back |
+| S5 | drive off in the middle of a correction | aborted within 1.5 s, valves closed |
+| S6 | load with no BLE client, then it connects | vetoed while absent; corrected after |
+| S7 | RD wire break, then a second sensor | corner frozen; FAULT with two |
+| S8 | jacked at RP, phone connected | EXTERNAL freeze; nothing moves; clears |
 | S9 | user jogs FD during an automatic rear correction | supervisor yields; only FD re-baselined |
 | S10 | fast leak (25 %/h) | latched after 3 fast refills; one refill per reconnect |
-| S11b | show preset 1 (0 % / 0 psi), people in and out | zero automatic actions; no false sensor fault |
-| S14 | the owner's leak: RD compressed on the hill spot, 2 %/h, 24 h connected | never latched; RD held at its arrival height |
-| S15 | 4 h road trip with RD leaking 2.5 %/h | cruise pulses on RD only, never during a corner or brake; RD within 2 % of the others |
-| S16 | dips and the bottom of hills at speed: normal road, glass-smooth road, long highway sags; then real load after parking | no fill, dump or pulse in any case; the confirmation rule exercised and holding; weight after parking still compensated |
-| S17 | the shadow build: leak plus load for 2 h, phone connected | logs `SHADOW would START`; zero actuation; no leak bookkeeping from decisions that never ran |
-| S18 | get in and drive from the hill spot: no BLE overnight, trunk + passenger loaded with the car off, controller connects when the driver sits, drive off 8 s later; arrive on flat ground, or back on the crown; plus a "nobody drives off" variant | level plane back at the preset (twist removed) within the deadband after arrival; the crown's twist kept at home; prints the drive-away pulses and how fast the parked correction starts |
-| S19 | the owner's real spot (twist ~-33 %: FP 34, RP 87, FD 100, RD 23, both compressed corners below min ride): with the usual tank settings, and with the tank kept high; park, night with an RD leak and no BLE, load with the car off, leave; arrive on flat ground, come back, or stay | the min-ride lift is attempted on both corners, and any refusal (tank / bag ceiling) is logged; the lift starts the moment the controller connects; hanging corners never dumped; flat-ground arrival level to the preset |
-
-(S12, the valve/sensor cross-wiring scenario, was removed together with that check.)
+| S11b | show preset (0 % / 0 psi), people in and out | zero automatic actions; no false fault |
+| S14 | RD compressed on the hill spot, leaking 2 %/h, 24 h connected | never latched; RD held at its arrival height |
+| S15 | 4 h road trip, RD leaking 2.5 %/h | pulses on RD only; one caught by a curve / brake starting is cut within 0.3 s; RD kept near the others |
+| S16 | dips and hill bottoms at speed (normal, glassy, long sags); then real load after parking | no fill / dump / pulse; the confirmation rule exercised; load after parking still corrected |
+| S17 | shadow build, leak + load 2 h | `SHADOW would START` logged; zero actuation; no leak bookkeeping from decisions that never ran |
+| S18 | get in and drive from the hill spot (no BLE overnight, loaded with the car off, leave 8 s after the driver sits); flat ground / back home / nobody drives | level while still driving; level on arrival; crown twist kept at home |
+| S19 | the owner's spot (twist ~-33 %), with the owner's car (65 psi, tank 145 / 180, min ride 20): night with an RD leak, load, connect, leave / come back / stay; plus a spot that presses corners below min ride, and a tank that can never get above the bag | lift starts the moment the controller connects; hanging corners never dumped; flat arrival level; min-ride lift on the spot; refusal logged |
 
 ## Adding a scenario
 
-1. Write a function in `eval/hcs_sim.cpp`:
+```cpp
+static void scenarioMyCase()
+{
+    printf("\nS20 short description\n");
+    Sim s;
+    g_log.clear();
+    parkedAtPreset(s);            // boot, preset 50/50/50/50 committed
+    s.drive(300, 0.6f);           // 5 min driving
+    s.run(180);                   // parked 3 min
+    s.disturbance(6);             // someone gets in...
+    s.extraF[C_RD] += 0.15f;      // ...behind the driver
+    s.run(120);
+    check(fabsf(s.h[C_RD] - 50) <= HCS_DEADBAND_H, "S20", fmt("RD back (%.1f)", s.h[C_RD]));
+}
+```
 
-   ```cpp
-   static void scenarioMyCase()
-   {
-       printf("\nS17 short description\n");
-       Sim s;
-       g_log.clear();
-       parkedAtPreset(s);            // boot, 15 s, preset 50/50/50/50 committed, 30 s
-       s.drive(300, 0.6f);           // 5 min driving, roughness 0.6, sweepers + braking every 60 s
-       s.run(180);                   // parked 3 min
-       s.disturbance(6);             // someone gets in (6 s of shaking)
-       s.extraF[C_RD] += 0.15f;      // ...and sits behind the driver
-       s.run(120, [](Sim &x) { /* per-tick changes, e.g. x.heave = ... */ });
-       check(s.startsWhileMoving == 0, "S17", "nothing while moving");
-       check(fabsf(s.h[C_RD] - 50) <= HCS_DEADBAND_H, "S17", fmt("RD back (%.1f)", s.h[C_RD]));
-       check(countLog("LOAD") > 0, "S17", "classified as LOAD");
-   }
-   ```
+Add `{"S20", scenarioMyCase}` to the table in `main()`, and confirm the new check fails when its rule is disabled.
 
-2. Add `{"S17", scenarioMyCase}` to the table in `main()`.
+Handles: `s.run(seconds, perTick)`, `s.drive(seconds, roughness, events, periodS)`, `s.disturbance(seconds)`, `s.boot(restore)`, `s.presence`, `s.tank`, `s.pNom`, `s.minRide`, `s.T`, `s.warp`, `s.roll`, `s.pitch`, `s.heave`, `s.extraF[]`, `s.leakPerHour[]`, `s.jacked[]`, `s.rawFault[]`, `s.manualIn[]`; readings `s.h[]`, `s.p[]`; counters `s.starts`, `s.startsWhileMoving`, `s.fillsOn[]`, `s.dumpsOn[]`, `s.pulsesOn[]`, `s.pulsesInEvent`; `countLog("text")`.
 
-**Useful handles:**
-- **Time:** `s.run(seconds, perTick)`, `s.drive(seconds, roughness, events, periodS)`, `s.disturbance(seconds)`.
-- **Supervisor:** `s.boot(restore)` (reboot, optionally restoring the last persisted blob), `s.commitPreset()`, `s.core.notifyPresetLoad(h)`.
-- **Car and world:** `s.presence`, `s.enabled`, `s.tank`, `s.T`, `s.warp`, `s.roll`, `s.pitch`, `s.heave`, `s.extraF[]`, `s.leakPerHour[]`, `s.jacked[]`, `s.rawFault[]`, `s.manualIn[]`.
-- **Readings and counters:** `s.h[]`, `s.p[]`, `s.starts`, `s.startsWhileMoving`, `s.valveMsWhileMoving`, `s.fillsOn[]`, `s.dumpsOn[]`, `s.pulses`, `s.pulsesOn[]`, `s.pulsesInEvent`, `s.maxH[]`, `s.core.state()`.
-- **Log:** `countLog("text")` counts HCS log lines containing the text.
-
-**Turning a field log into a scenario:** take the `HCS ...` and `HCSD` lines around the event, then reproduce the situation, not the samples: what the car was doing, the load, the leak, BLE presence. The simulator does not replay recorded sensor data (yet). If the real car shows something the plant cannot produce (for example bag hysteresis), extend the plant first and note it in this document.
+**From a field log:** take the `HCS` / `HCSD` lines around the event and reproduce the situation (what the car was doing, load, leak, BLE), not the samples. If the car shows something the plant cannot produce (e.g. bag hysteresis), extend the plant first.

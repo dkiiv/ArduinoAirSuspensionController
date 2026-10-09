@@ -1,4 +1,4 @@
-// HCS sensing: sample intake, electrical sensor faults, motion detector, STATS. See hcs_core.h.
+// HCS sensing: sample intake, electrical sensor faults, motion detector. See hcs_core.h.
 
 #include "hcs_core.h"
 
@@ -81,7 +81,7 @@ void Core::ingest(const Inputs &in)
             // valves moving air on this corner: readings are flow-affected, restart its windows
             k.busy = true;
             k.idleSince = now;
-            k.qOk = false;
+            k.qOk = k.qPrev = false;
             k.nh = k.ih = k.np = k.ip = k.ndh = k.ndp = 0;
         }
         else if (k.busy)
@@ -99,10 +99,12 @@ void Core::ingest(const Inputs &in)
         detectFaults(in, i);
         if (busy)
             continue;
-        k.lastH = k.liveH = x.h;
-        if (!k.qOk || k.qSince != lastMotion)
+        // steadiness window: restarts after a movement / our own valve activity, and every 2 x HCS_CONFIRM_MS so a
+        // slow drift (a leak) cannot keep it from ever being steady
+        if (!k.qOk || k.qSince != lastMotion || (now - k.qStart) >= 2UL * HCS_CONFIRM_MS)
         {
-            k.qLo = k.qHi = x.h; // restart: first sample after a movement / our own valve activity
+            k.qPrev = k.qOk && k.qSince == lastMotion && (k.qHi - k.qLo) <= HCS_STABLE_RANGE_H; // carried: still = steady
+            k.qLo = k.qHi = x.h;
             k.qSince = lastMotion;
             k.qStart = now;
             k.qOk = true;
@@ -180,17 +182,14 @@ bool Core::windowMean(int i, float &hm, float &pm, bool &pOk, bool &stable) cons
 // threshold; >= HCS_MOTION_MIN_CORNERS votes for HCS_MOTION_START_TICKS start an episode; HCS_EPISODE_GAP_MS of
 // quiet ends it; an episode longer than HCS_DRIVE_CONFIRM_MS is DRIVING. Corners whose valves are moving air are
 // excluded; if fewer than 2 corners can be watched the car is treated as "not quiet" (fail-safe).
-void Core::motionDetect(const Inputs &in, uint32_t dt)
+void Core::motionDetect()
 {
-    (void)dt;
     int included = 0, voting = 0, strong = 0;
-    bool inc[NC] = {false, false, false, false};
     for (int i = 0; i < NC; i++)
     {
         const Corner &k = c[i];
         if (k.hFault || k.busy || (now - k.idleSince) < HCS_P_SETTLE_MS || k.ndh < 3)
             continue;
-        inc[i] = true;
         included++;
         const bool pv = pUsable(i);
         if (k.actH > HCS_MOTION_H_THRESH || (pv && k.actP > HCS_MOTION_P_THRESH))
@@ -201,12 +200,6 @@ void Core::motionDetect(const Inputs &in, uint32_t dt)
     lastIncluded = included;
     lastVoting = voting;
     lastStrong = strong;
-    statsSample(in, inc);
-    if ((now - statsAt) >= HCS_STATS_PERIOD_MS)
-    {
-        statsAt = now;
-        statsFlush();
-    }
 
     if (included < HCS_MOTION_MIN_CORNERS)
     {
@@ -229,39 +222,18 @@ void Core::motionDetect(const Inputs &in, uint32_t dt)
         lastMotion = now;
         if (!driving && (now - episodeStart) >= HCS_DRIVE_CONFIRM_MS)
         {
-            driving = true;
-            armedAfterDrive = true;
-            driveStartAt = episodeStart;
-            for (int i = 0; i < NC; i++)
-            {
-                c[i].cruiseInit = c[i].cruiseLow = c[i].cruiseRef = false;
-                c[i].cruiseCnt = 0;
-            }
+            driving = armedAfterDrive = true;
             logf("DRIVING confirmed (motion for %lus) -> parked corrections vetoed; re-baseline on arrival",
                  (unsigned long)((now - episodeStart) / 1000));
-            for (int i = 0; i < NC; i++)
-            {
-                Corner &k = c[i];
-                if (k.oweCand > HCS_LAND_TOL)
-                {
-                    k.owe = fminf_(fmaxf_(k.owe, k.oweCand), HCS_OWE_MAX);
-                    logf("DRIVE-AWAY %s: parked fill not done, owes %.1f%% -> top up in steady driving", CN[i], k.owe);
-                }
-                k.oweCand = 0;
-            }
-            for (int i = 0; i < NC; i++)
-                c[i].roadPending = false; // a new drive decides afresh
-            if (externalFreeze)
-            {
-                externalFreeze = false; // a car on a jack / lift is not driving (an unloaded wheel was uneven ground)
-                logf("EXTERNAL cleared: driving");
-            }
-            oweAt = driveLoadAt = now;
-            driveLoadDone = false;
-            driveLoadCnt = 0;
+            roadDefValid = false; // a new drive decides afresh
             sdN = 0;
             for (int i = 0; i < NC; i++)
-                c[i].sdH = c[i].sdP = 0;
+                c[i].roadPending = false, c[i].sdH = c[i].owe = 0, c[i].pulsedMs = 0;
+            if (externalFreeze)
+            {
+                externalFreeze = false; // a car on a jack is not driving (the unloaded wheel was uneven ground)
+                logf("EXTERNAL cleared: driving");
+            }
         }
     }
     else if (inEpisode && (now - lastMotion) >= HCS_EPISODE_GAP_MS)
@@ -269,90 +241,13 @@ void Core::motionDetect(const Inputs &in, uint32_t dt)
         inEpisode = false;
         logf("MOTION end ep=%lu after %lus (%s)", (unsigned long)episodeId, (unsigned long)((lastMotion - episodeStart) / 1000),
              driving ? "drive" : "disturbance");
-        if (driving && sdN >= HCS_DRIVE_LOAD_MIN_MS / HCS_TICK_MS)
-        {
-            for (int i = 0; i < NC; i++)
-                c[i].pRoad = c[i].sdP / sdN; // what the bags carried on the road this trip
-            roadValid = true;
-            float hmean[NC], d[NC], ref[NC];
-            for (int i = 0; i < NC; i++)
-            {
-                hmean[i] = c[i].sdH / sdN;
-                ref[i] = presetValid ? (float)presetH[i] : c[i].tgt;
-            }
-            roadDefValid = planeDeficit(hmean, d, ref);
-            for (int i = 0; i < NC; i++)
-                c[i].roadDef = roadDefValid ? d[i] : 0;
-            if (roadDefValid)
-                logf("ROAD level vs preset (+ = sat low): FP %+.1f RP %+.1f FD %+.1f RD %+.1f", d[C_FP], d[C_RP], d[C_FD], d[C_RD]);
-            markPersist(false);
-        }
         driving = false;
         needEval = true;
     }
 }
 
-// STATS: per corner, a histogram of the motion detector's activity in multiples of its threshold
-// [<.25 | .25-.5 | .5-1 | 1-2 | 2-4 | >4] for QUIET (parked, no episode) and DRIVE, plus the parked standard deviation
-// of height and pressure. This is the data needed to set HCS_MOTION_*_THRESH for a real car.
-static int statBucket(float r) { return r < 0.25f ? 0 : r < 0.5f ? 1 : r < 1.0f ? 2 : r < 2.0f ? 3 : r < 4.0f ? 4 : 5; }
-
-void Core::statsSample(const Inputs &in, const bool *inc)
-{
-    const int ctx = driving ? 1 : (!inEpisode ? 0 : -1); // disturbances are neither
-    if (ctx < 0)
-        return;
-    for (int i = 0; i < NC; i++)
-    {
-        if (!inc[i])
-            continue;
-        uint16_t &bh = stH[ctx][i][statBucket(c[i].actH / HCS_MOTION_H_THRESH)];
-        if (bh < 65535)
-            bh++;
-        if (pUsable(i))
-        {
-            uint16_t &bp = stP[ctx][i][statBucket(c[i].actP / HCS_MOTION_P_THRESH)];
-            if (bp < 65535)
-                bp++;
-        }
-        if (ctx == 0)
-        {
-            sqN[i] += 1;
-            sqH[i] += in.c[i].h;
-            sqH2[i] += (double)in.c[i].h * in.c[i].h;
-            sqP[i] += in.c[i].p;
-            sqP2[i] += (double)in.c[i].p * in.c[i].p;
-        }
-    }
-}
-
-void Core::statsFlush()
-{
-    static const char *const CTX[2] = {"QUIET", "DRIVE"};
-    for (int ctx = 0; ctx < 2; ctx++)
-        for (int i = 0; i < NC; i++)
-        {
-            const uint16_t *a = stH[ctx][i], *b = stP[ctx][i];
-            if (a[0] + a[1] + a[2] + a[3] + a[4] + a[5] == 0)
-                continue;
-            char sd[48] = "";
-            if (ctx == 0 && sqN[i] > 10)
-            {
-                double mh = sqH[i] / sqN[i], mp = sqP[i] / sqN[i];
-                double vh = sqH2[i] / sqN[i] - mh * mh, vp = sqP2[i] / sqN[i] - mp * mp;
-                snprintf(sd, sizeof(sd), " sdH=%.3f sdP=%.2f", sqrt(vh > 0 ? vh : 0), sqrt(vp > 0 ? vp : 0));
-            }
-            logf("STATS %s %s H/th[%u %u %u %u %u %u] P/th[%u %u %u %u %u %u]%s", CTX[ctx], CN[i], a[0], a[1], a[2], a[3], a[4], a[5],
-                 b[0], b[1], b[2], b[3], b[4], b[5], sd);
-        }
-    memset(stH, 0, sizeof(stH));
-    memset(stP, 0, sizeof(stP));
-    for (int i = 0; i < NC; i++)
-        sqN[i] = sqH[i] = sqH2[i] = sqP[i] = sqP2[i] = 0;
-}
-
-// Has every healthy corner stayed inside HCS_STABLE_RANGE_H since the last movement (or our own valve activity),
-// for HCS_CONFIRM_MS? Returns the ms still needed, 0 when it has, 0xFFFFFFFF when a corner moved too much.
+// Has every healthy corner held inside HCS_STABLE_RANGE_H, with no movement / own valve activity, for HCS_CONFIRM_MS
+// (a window that ended steady carries over)? Returns the ms still needed, 0 when it has, 0xFFFFFFFF if it moved.
 uint32_t Core::steadyRemaining() const
 {
     uint32_t need = 0;
@@ -364,7 +259,7 @@ uint32_t Core::steadyRemaining() const
         if (!k.qOk || (k.qHi - k.qLo) > HCS_STABLE_RANGE_H)
             return 0xFFFFFFFFUL;
         const uint32_t age = now - k.qStart;
-        if (age < HCS_CONFIRM_MS && HCS_CONFIRM_MS - age > need)
+        if (!k.qPrev && age < HCS_CONFIRM_MS && HCS_CONFIRM_MS - age > need)
             need = HCS_CONFIRM_MS - age;
     }
     return need;

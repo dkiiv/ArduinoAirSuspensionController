@@ -25,7 +25,7 @@
 #include "../src/heightControl/hcs_core.cpp"
 #include "../src/heightControl/hcs_sense.cpp"
 #include "../src/heightControl/hcs_classify.cpp"
-#include "../src/heightControl/hcs_cruise.cpp"
+#include "../src/heightControl/hcs_drive.cpp"
 
 #include <cmath>
 #include <cstdio>
@@ -84,6 +84,7 @@ struct Sim
     float tank = 170;
     bool compOn = false;
     float tankOn = 140, tankOff = 180; // compressor cut-in / cut-out (app settings)
+    float pNom = 100;                  // bag psi at the preset height, unloaded (the owner's car: ~65)
     bool presence = true;
     bool shadow = false; // boot the supervisor in shadow mode (decide + log, never actuate)
     bool enabled = true;
@@ -96,6 +97,7 @@ struct Sim
     uint32_t pulseUntil[4] = {0, 0, 0, 0};
     uint32_t seq = 0;
     int pulses = 0, pulsesInEvent = 0, pulsesOn[4] = {0, 0, 0, 0};
+    float pulseRoll[4] = {99, 99, 99, 99}, pulsePitch[4] = {0, 0, 0, 0};
     uint32_t pulseMsTotal = 0;
 
     // calibration
@@ -119,15 +121,15 @@ struct Sim
             x = Routine();
     }
 
-    float F(int i) const { return p[i] / 100.0f; } // corner load fraction (diagnostics)
+    float F(int i) const { return p[i] / pNom; } // corner load fraction (diagnostics)
 
-    float pAir(int i, float L) const { return 100.0f * m[i] * T * 60.0f / ((L < 0 ? 0 : L) + 10.0f); }
+    float pAir(int i, float L) const { return pNom * m[i] * T * 60.0f / ((L < 0 ? 0 : L) + 10.0f); }
 
     // corner force on the body and its derivative w.r.t. the corner's body height
     void cornerForce(int i, float L, float zc, float &f, float &d) const
     {
         float La = L < 100 ? L : 100;
-        float pa = pAir(i, La);
+        float pa = pAir(i, La) * (100.0f / pNom); // force units: 100 = a quarter of the car
         float on = L <= 100 ? 1.0f : (L >= 101 ? 0.0f : 101 - L); // wheel leaves the ground past full extension
         f = pa * on;
         d = (L < 100 ? -pa / (La + 10) : 0) * on - (L > 100 && L < 101 ? pa : 0);
@@ -231,8 +233,12 @@ struct Sim
             bool pulsing = pulseUntil[i] != 0 && (int32_t)(t - pulseUntil[i]) < 0;
             if (pulseUntil[i] != 0 && !pulsing)
                 pulseUntil[i] = 0;
-            if (pulsing && (fabsf(roll) > 0.01f || fabsf(pitch) > 0.01f))
-                pulsesInEvent++; // a valve open at speed while the body is loaded by a corner / brake event
+            if (pulsing && pulseRoll[i] > 9.0f)
+                pulseRoll[i] = roll, pulsePitch[i] = pitch; // body state when the pulse started
+            if (pulsing && (fabsf(roll - pulseRoll[i]) > 0.01f || fabsf(pitch - pulsePitch[i]) > 0.01f))
+                pulsesInEvent++; // still open after a curve / brake began
+            if (!pulsing)
+                pulseRoll[i] = 99.0f;
             if (pulsing)
                 pulseMsTotal += dtMs;
             bool inOpen = manualIn[i] || pulsing, outOpen = false;
@@ -254,12 +260,12 @@ struct Sim
             const int v = i;
             if (inOpen && tank > p[v])
             {
-                float dm = 0.083f * (tank - p[v]) / 100.0f * dt;
+                float dm = 0.083f * (tank - p[v]) / pNom * dt;
                 m[v] += dm;
                 tank -= dm * 150.0f;
             }
             if (outOpen)
-                m[v] -= 0.06f * (p[v] / 100.0f) * dt;
+                m[v] -= 0.06f * (p[v] / pNom) * dt;
             if (inOpen || outOpen)
             {
                 anyValveOpenNow = true;
@@ -513,12 +519,19 @@ static void scenarioHill()
 // R5: driving / cornering / braking / smooth highway / red lights, with a leak and a passenger tempting the classifier
 static void scenarioDriving()
 {
-    printf("\nS2 driving: sweepers, braking, smooth highway, red lights (no leak: nothing may actuate)\n");
+    printf("\nS2 driving: sweepers, braking, a spiral ramp, smooth highway, red lights (no leak: nothing may actuate)\n");
     Sim s;
     g_log.clear();
     parkedAtPreset(s);
     for (int lap = 0; lap < 6; lap++)
     {
+        if (lap == 2)
+        {
+            s.moving = true; // parking-garage spiral: 3 min turning the same way (inside corners sit low, not the car)
+            s.rough = 0.5f;
+            s.run(180, [](Sim &x) { x.roll = 0.15f; });
+            s.roll = 0;
+        }
         s.drive(240, 0.8f);         // normal road with sweepers / braking
         s.drive(300, 0.35f);        // smooth highway, still cornering
         s.moving = false;           // red light: stopped but "in traffic"
@@ -527,7 +540,7 @@ static void scenarioDriving()
     printf("  starts while moving=%d, valve-ms while moving=%u, DRIVING confirmations=%d, total starts=%d\n", s.startsWhileMoving,
            s.valveMsWhileMoving, countLog("DRIVING confirmed"), s.starts);
     check(s.startsWhileMoving == 0 && s.valveMsWhileMoving == 0 && s.pulses == 0, "S2",
-          "zero autonomous actuation while moving incl. cruise top-up (cornering, braking, highway)");
+          "zero autonomous actuation while moving incl. road top-up (cornering, braking, spiral ramp, highway)");
     check(s.starts == 0, "S2", "no actuation at 60 s red lights either (arrival quiet = 120 s)");
 
     printf("  worst case: motion detector BLIND (sensor-noise-only road) during a 5 min sustained sweeper\n");
@@ -567,7 +580,7 @@ static void scenarioLeakBelowMin()
     s.extraF[C_RD] += 0.04f;
     s.run(300);
     printf("  5 min after owner returns: FP=%.1f RP=%.1f FD=%.1f RD=%.1f, starts=%d\n", s.h[0], s.h[1], s.h[2], s.h[3], s.starts);
-    check(s.h[C_RD] >= 50 - HCS_LAND_TOL - 0.5f, "S3", fmt("RD lifted back to the preset, incl. completion pass (%.1f)", s.h[C_RD]));
+    check(fabsf(s.h[C_RD] - 50) <= HCS_DEADBAND_H, "S3", fmt("RD lifted back into the deadband around the preset (%.1f)", s.h[C_RD]));
 
     printf("  variant: fresh boot with NOTHING persisted while RD already sits at %.0f\n", 26.0f);
     Sim f;
@@ -793,7 +806,7 @@ static void scenarioOwnersLeak()
     check(worstRD <= HCS_DEADBAND_H + 1.0f, "S14", fmt("RD held at its arrival height all day (worst sag %.1f)", worstRD));
 }
 
-// Road trip: 4 h of continuous driving with a slow leak -> cruise top-up keeps the corner up, only when steady
+// Road trip: 4 h of continuous driving with a slow leak -> road-level pulses keep the corner up, only when calm
 static void scenarioRoadTrip()
 {
     printf("\nS15 road trip: 4 h non-stop, RD leaking 2.5 %%/h of its air; 5 min twisty / 5 min highway alternating\n");
@@ -820,7 +833,7 @@ static void scenarioRoadTrip()
             worstLate = fmaxf(worstLate, others - s.h[C_RD]);
         }
     }
-    printf("  pulses: FP=%d RP=%d FD=%d RD=%d (total %u ms), pulses overlapping a corner/brake event: %d\n", s.pulsesOn[0], s.pulsesOn[1],
+    printf("  pulses: FP=%d RP=%d FD=%d RD=%d (total %u ms), 100 ms ticks a pulse stayed open after a curve / brake began: %d\n", s.pulsesOn[0], s.pulsesOn[1],
            s.pulsesOn[2], s.pulsesOn[3], s.pulseMsTotal, s.pulsesInEvent);
     printf("  RD air lost %.1f%% to the leak; worst RD deficit vs others after the first hour: %.1f%%\n", (mStart - s.m[C_RD]) * 100.0f,
            worstLate);
@@ -828,9 +841,9 @@ static void scenarioRoadTrip()
     s.solve();
     printf("  static now: h FP=%.1f RP=%.1f FD=%.1f RD=%.1f | p FP=%.1f RP=%.1f FD=%.1f RD=%.1f\n", s.h[0], s.h[1], s.h[2], s.h[3], s.p[0],
            s.p[1], s.p[2], s.p[3]);
-    check(s.pulsesOn[C_RD] >= 1 && s.pulsesOn[C_FP] + s.pulsesOn[C_RP] + s.pulsesOn[C_FD] == 0 && s.startsWhileMoving == 0 &&
-              s.pulsesInEvent == 0,
-          "S15", "pulses only, on the leaking corner only, never during a corner / brake");
+    const int np = s.pulsesOn[0] + s.pulsesOn[1] + s.pulsesOn[2] + s.pulsesOn[3];
+    check(s.pulsesOn[C_RD] >= 1 && np == s.pulsesOn[C_RD] && s.startsWhileMoving == 0 && s.pulsesInEvent <= 3 * np, "S15",
+          "pulses only, on the leaking corner only; one caught by a curve / brake starting is cut within 0.3 s");
     check(worstLate <= 6.0f, "S15", fmt("RD kept within %.1f%% of the others (no top-up: grows ~1.5 %%/h)", worstLate));
 }
 
@@ -1002,7 +1015,7 @@ static void leaveSevere(Sim &s)
 
 static void scenarioSevereSpot()
 {
-    printf("\nS19 the owner's severe hill spot (twist ~-33 %%, compressed corners below min ride): park, night, load, leave\n");
+    printf("\nS19 the owner's severe hill spot (twist ~-33 %%): park, night, load, leave\n");
     const char *names[3] = {"arrive on flat ground", "come back to the spot", "nobody drives"};
     {
         // with the usual tank settings (cut-in 140, cut-out 180) RD's bag (~170 psi on this spot) cannot be lifted:
@@ -1019,8 +1032,8 @@ static void scenarioSevereSpot()
         check(countLog("REFUSE RD BOTTOM_GUARD fill: tank", mark) > 0 && s.dumpsOn[C_FD] + s.dumpsOn[C_RP] == 0, "S19",
               "tank too low for the loaded corner: refused with the reason logged, hanging corners never dumped");
     }
-    for (int dest = 0; dest < 3; dest++)
     {
+        // a spot that presses corners below min ride (min ride 35 here): they are lifted on the spot, any cause
         Sim s;
         g_log.clear();
         s.tankOn = 180; // tank kept high (app: compressor on / off psi)
@@ -1028,20 +1041,36 @@ static void scenarioSevereSpot()
         s.tank = 195;
         parkedAtPreset(s);
         s.drive(300, 0.6f);
+        const size_t mark = g_log.size();
+        parkSevere(s);
+        s.run(600); // car still on, controller connected, 10 min
+        const bool liftRD = countLog("START fill RD BOTTOM_GUARD", mark) + countLog("RD BOTTOM_GUARD 2", mark) > 0;
+        printf("  min ride 35: 10 min at the spot: FP %.1f RP %.1f FD %.1f RD %.1f (RD bag %.0f psi)\n", s.h[0], s.h[1], s.h[2], s.h[3], s.p[C_RD]);
+        check(liftRD && countLog("FP BOTTOM_GUARD", mark) > 0 && (s.h[C_RD] >= 35.0f || countLog("REFUSE RD BOTTOM_GUARD", mark) > 0), "S19",
+              "both corners below min ride are lifted; RD reaches it, or why not (tank / bag ceiling) is logged");
+    }
+    for (int dest = 0; dest < 3; dest++)
+    {
+        // the owner's car: ~65 psi at the preset, tank 145 / 180, min ride 20 -> the compressed corners sit just above
+        // min ride at 90-120 psi on the spot
+        Sim s;
+        g_log.clear();
+        s.pNom = 65;
+        s.tankOn = 145;
+        s.tankOff = 180;
+        s.minRide = 20;
+        parkedAtPreset(s);
+        s.drive(300, 0.6f);
         size_t mark = g_log.size();
         parkSevere(s);
         const int dumps0 = s.dumpsOn[C_FD] + s.dumpsOn[C_RP];
-        s.run(600); // car still on, controller connected, 10 min
+        s.run(600);
         if (dest == 0)
-        {
-            const bool liftRD = countLog("START fill RD BOTTOM_GUARD", mark) + countLog("BOTTOM_GUARD 2", mark) > 0 || countLog("RD BOTTOM_GUARD 2", mark) > 0;
-            printf("  10 min at the spot: FP %.1f RP %.1f FD %.1f RD %.1f (RD bag %.0f psi)\n", s.h[0], s.h[1], s.h[2], s.h[3], s.p[C_RD]);
-            check(liftRD && countLog("FP BOTTOM_GUARD", mark) > 0 && (s.h[C_RD] >= 35.0f || countLog("REFUSE RD BOTTOM_GUARD", mark) > 0), "S19",
-                  "both corners below min ride are lifted; RD reaches it, or why not (tank / bag ceiling) is logged");
-        }
-        // night: car off, RD leaking ~1.5 %/h of its air
+            printf("  owner's car, 10 min at the spot: FP %.1f RP %.1f FD %.1f RD %.1f (bags %.0f/%.0f/%.0f/%.0f psi), starts %d\n", s.h[0],
+                   s.h[1], s.h[2], s.h[3], s.p[0], s.p[1], s.p[2], s.p[3], countLog("START", mark));
+        // night: car off, RD leaking ~3 %/h of its air (by morning it is below min ride: it would drag the frame)
         s.presence = false;
-        s.leakPerHour[C_RD] = 0.015f;
+        s.leakPerHour[C_RD] = 0.03f;
         s.run(8 * 3600);
         s.leakPerHour[C_RD] = 0;
         // morning, car off: 20 kg in the trunk, a rear passenger behind the driver; then the driver; controller connects
@@ -1058,8 +1087,8 @@ static void scenarioSevereSpot()
         s.run(dest == 2 ? 300 : 12, [&](Sim &x) { x.rough = (x.t - t0) < 5000 ? 0.8f : 0; }); // the driver settling in
         if (dest == 0)
         {
-            printf("  morning: controller connects with RD below min ride -> %s; RD %.1f 12 s later\n",
-                   countLog("URGENT", mark) ? "lift starts at once" : "no urgent lift", s.h[C_RD]);
+            printf("  morning: controller connects with RD below min ride -> %s; RD %.1f 12 s later (bag %.0f psi, tank %.0f)\n",
+                   countLog("URGENT", mark) ? "lift starts at once" : "no urgent lift", s.h[C_RD], s.p[C_RD], s.tank);
             check(countLog("URGENT", mark) > 0 && countLog("START fill RD BOTTOM_GUARD", mark) > 0, "S19",
                   "lift starts the moment the controller connects (does not wait for people to settle)");
         }
