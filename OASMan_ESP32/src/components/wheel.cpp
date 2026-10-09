@@ -1,5 +1,6 @@
 #include "wheel.h"
 #include "manifold.h"
+#include "../heightControl/heightControlSupervisor.h"
 
 #define NUM_WHEEL_THREADS 4
 std::atomic<bool> flagStartPressureGoalRoutine[NUM_WHEEL_THREADS];
@@ -90,10 +91,13 @@ float Wheel::readLevelSensorRaw()
 // min/max points. Defaults (min=0, max=100) make this an identity mapping.
 float Wheel::readLevelSensorNormalized()
 {
+    return this->normalizeLevel(this->readLevelSensorRaw());
+}
+
+float Wheel::normalizeLevel(float reading)
+{
     float calMin = getheightCalMin(this->thisWheelNum);
     float calMax = getheightCalMax(this->thisWheelNum);
-
-    float reading = this->readLevelSensorRaw(); // always 0 to 100
 
     bool inverted = calMin > calMax;
 
@@ -129,8 +133,11 @@ void Wheel::readInputs()
     this->pressureValue = readPinPressure(this->pressurePin, false);
     if (getheightSensorMode())
     {
-        this->levelValue = readLevelSensorNormalized();
+        float raw = this->readLevelSensorRaw(); // read once: raw kept for the supervisor's wire-break checks
+        this->levelRawValue = raw;
+        this->levelValue = this->normalizeLevel(raw);
     }
+    this->sampleSeq = this->sampleSeq + 1;
 }
 
 float Wheel::getSelectedInputValue()
@@ -151,7 +158,67 @@ bool Wheel::isActive()
     return getInSolenoid()->isOpen() || getOutSolenoid()->isOpen() || flagStartPressureGoalRoutine[thisWheelNum].load();
 }
 
+bool Wheel::isRoutineFlagged()
+{
+    return flagStartPressureGoalRoutine[thisWheelNum].load();
+}
+
 bool Wheel::initPressureGoal(int newPressure, bool onlyAirUp, std::function<void()> onComplete)
+{
+    return this->startGoal(newPressure, onlyAirUp, false, false, onComplete);
+}
+
+bool Wheel::initAutonomousGoal(int target, int8_t dir, float ceilH, float floorH, float ceilP)
+{
+    this->autoCeilH = ceilH;
+    this->autoFloorH = floorH;
+    this->autoCeilP = ceilP;
+    return this->startGoal(target, dir > 0, dir < 0, true, nullptr);
+}
+
+void Wheel::requestAutonomousAbort()
+{
+    if (!this->autonomous)
+    {
+        return; // the user took this wheel over -> never interfere with a user routine
+    }
+    this->autoAbort = true;
+    getInSolenoid()->close();
+    getOutSolenoid()->close();
+}
+
+// Autonomous routines only: abort request, shorter timeout, and the hard height / bag-pressure bounds,
+// re-checked with the freshest reading on every loop. Always false for user routines.
+bool Wheel::autonomousMustStop(int8_t dir)
+{
+#if HEIGHT_CONTROL_SUPERVISOR
+    if (!this->autonomous)
+    {
+        return false;
+    }
+    if (this->autoAbort)
+    {
+        return true;
+    }
+    if ((millis() - this->routineStartTime) > (unsigned long)HCS_ROUTINE_TIMEOUT_MS)
+    {
+        return true;
+    }
+    if (dir > 0 && (this->levelValue >= this->autoCeilH || this->pressureValue >= this->autoCeilP))
+    {
+        return true; // pressure here is the flowing (inflated) reading -> conservative
+    }
+    if (dir < 0 && this->levelValue <= this->autoFloorH)
+    {
+        return true;
+    }
+#else
+    (void)dir;
+#endif
+    return false;
+}
+
+bool Wheel::startGoal(int newPressure, bool onlyAirUp, bool onlyAirDown, bool autonomous, std::function<void()> onComplete)
 {
 
     if (newPressure > (getheightSensorMode() ? getHeightSensorMax() * 1.03f : getbagMaxPressure()))
@@ -175,6 +242,10 @@ bool Wheel::initPressureGoal(int newPressure, bool onlyAirUp, std::function<void
         }
         if (pressureDif < 0 || !tankIsLowerThanBag)
         {
+            // order matters: clear/set the autonomous state BEFORE raising the flag the wheel task polls
+            this->autoAbort = false;
+            this->autonomous = autonomous;
+            this->onlyAirDown = onlyAirDown;
             this->pressureGoal = newPressure;
             this->routineStartTime = millis();
             this->onlyAirUp = onlyAirUp;
@@ -372,7 +443,7 @@ bool Wheel::achieveFineGoal()
 
     for (;;)
     {
-        if (millis() > this->routineStartTime + ROUTINE_TIMEOUT_MS)
+        if (millis() > this->routineStartTime + ROUTINE_TIMEOUT_MS || this->autonomousMustStop(0))
         {
             return false;
         }
@@ -388,6 +459,14 @@ bool Wheel::achieveFineGoal()
         if (dir == FLOW_DOWN && this->onlyAirUp)
         {
             return true; // maintain-pressure never vents; accept where we are
+        }
+        if (dir == FLOW_UP && this->onlyAirDown)
+        {
+            return true; // autonomous lowering never fills back up; accept where we are
+        }
+        if (this->autonomousMustStop(dir))
+        {
+            return false; // supervisor bound reached / abort requested
         }
 
         // Stuck detector: the true reading isn't moving between bursts (tank/bag exhausted) -> give up rather
@@ -470,6 +549,11 @@ void Wheel::goalRoutine() {
 
             this->readInputs();
 
+            if (this->autonomousMustStop(dir))
+            {
+                break; // supervisor abort / bound / autonomous timeout (valves closed right after the loop)
+            }
+
             if (dir == FLOW_NONE)
             {
                 // Valve is closed here, so the reading is the TRUE value. Decide: finish, hand off to the
@@ -485,6 +569,10 @@ void Wheel::goalRoutine() {
                 {
                     this->achieveFineGoal();
                     break;
+                }
+                if (rawDif > 0 && this->onlyAirDown)
+                {
+                    break; // autonomous lowering never fills
                 }
                 if (rawDif > 0)
                 {
@@ -572,6 +660,10 @@ void Wheel::goalRoutine() {
         const ModeTuning modeTune = getModeTuning(getheightSensorMode());
         for (int rc = 0; rc < FINAL_RECHECK_ROUNDS; rc++)
         {
+            if (this->autonomous && this->autoAbort)
+            {
+                break; // aborted autonomous routine: no re-corrections (goalSyncLeave below releases the others)
+            }
             double trueVal = this->waitForStableReading(modeTune.settleBand);
             if (abs(this->pressureGoal - (int)lround(trueVal)) > modeTune.deadband)
             {
@@ -600,6 +692,12 @@ void Wheel::goalRoutine() {
 }
 
 void Wheel::maintainPressure() {
+    #if HEIGHT_CONTROL_SUPERVISOR
+    if (hcsOwnsHeightMaintain())
+    {
+        return; // height-sensor mode + maintain: the Height Control Supervisor owns this (legacy path below untouched)
+    }
+    #endif
     #if BOARD_ALWAYS_ON_ACC_UNUSED_USE_BT_CONN_AS_VEHICLE_ON 
     if (!isVehicleOn())
     {

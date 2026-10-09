@@ -198,6 +198,7 @@ void runJoystickInput(bool *val,
 {
     if (cmp)
     {
+        hcsNotifyManual(); // manual valve control always wins over the supervisor
         // open valve for left and set oasmanJoystickState flag
         a->open();
         b->open();

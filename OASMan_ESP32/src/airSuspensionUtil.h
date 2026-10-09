@@ -9,6 +9,7 @@
 #include "manifoldSaveData.h"
 #include "sampleReading.tcc"
 #include "components/rf_receiver.h"
+#include "heightControl/heightControlSupervisor.h"
 #include <FastLED.h>
 
 extern InputType *pressureInputs[5];
