@@ -345,6 +345,9 @@ void Core::tickInner(const Inputs &in, Outputs &out)
         st = State::SETTLING;
         return;
     }
+    for (int i = 0; i < NC; i++) // a corner newly below min ride (a fast leak, a bleed): evaluate now, not in 30 s
+        if (!c[i].hFault && !c[i].busy && c[i].lastCls != Cls::BOTTOM_GUARD && in.c[i].h < floorTrigger(in, i))
+            needEval = true;
     const bool confirmDue = confirmAt != 0 && (int32_t)(now - confirmAt) >= 0;
     if (!needEval && !confirmDue && (now - lastEvalAt) < HCS_EVAL_PERIOD_MS)
     {

@@ -82,8 +82,8 @@
 #ifndef HCS_CONFIRM_MS
 #define HCS_CONFIRM_MS 10000
 #endif
-// Right after a detected disturbance (people / cargo rock the car; a smooth sag at speed does not) the confirmation is
-// this short, so added weight is corrected within seconds.
+// Right after a detected disturbance (people / cargo rock the car; a smooth sag at speed does not), and for a corner
+// below min ride, the confirmation is this short, so added weight or a dropped corner is corrected within seconds.
 #ifndef HCS_CONFIRM_LOAD_MS
 #define HCS_CONFIRM_LOAD_MS 3000
 #endif

@@ -148,7 +148,7 @@ private:
         bool hFault, pFault;
         int badH, badP;
         uint32_t goodSinceH, goodSinceP;
-        bool qOk, qPrev; // steadiness: height range [qLo, qHi] since qStart; qPrev = the last window ended steady
+        bool qOk; // steadiness: height range [qLo, qHi] since qStart
         float qLo, qHi;
         uint32_t qStart, qSince;
         // what to hold and the evidence (classify)
@@ -229,7 +229,7 @@ private:
     void detectFaults(const Inputs &in, int i);
     void motionDetect();
     bool windowMean(int i, float &hm, float &pm, bool &pOk, bool &stable) const;
-    uint32_t steadyRemaining(uint32_t need) const; // 0 = steady that long; 0xFFFFFFFF = moved too much
+    uint32_t steadyRemaining(uint32_t confirmMs) const; // ms still needed; 0 = steady that long
     bool pUsable(int i) const { return !c[i].pFault && c[i].ndp >= 3; }
     // hcs_classify.cpp
     void evaluate(const Inputs &in, Outputs &out, const char *kind, bool arrival);

@@ -592,6 +592,25 @@ static void scenarioLeakBelowMin()
     check(f.h[C_RD] >= f.minRide + HCS_FLOOR_LIFT_MARGIN - 1.0f, "S3", "BOTTOM_GUARD lifts an unanchored corner to min ride + margin");
     check(f.fillsOn[C_FP] + f.fillsOn[C_RP] + f.fillsOn[C_FD] + f.dumpsOn[C_FP] + f.dumpsOn[C_RP] + f.dumpsOn[C_FD] == 0, "S3",
           fmt("only RD actuated (the others moved by body coupling only: FP=%.1f RP=%.1f FD=%.1f)", f.h[C_FP], f.h[C_RP], f.h[C_FD]));
+
+    // variant: parked, controller connected, someone bleeds RP below min ride by hand at the manifold (no valve the
+    // supervisor can see) -- it must be lifted within seconds, not at the next periodic evaluation
+    Sim b;
+    g_log.clear();
+    parkedAtPreset(b);
+    b.run(200);
+    uint32_t tb = 0, tLift = 0;
+    const int sb = b.starts;
+    b.leakPerHour[C_RP] = 150.0f; // ~4 %/s of its air
+    b.run(90, [&](Sim &x) {
+        if (!tb && x.h[C_RP] < x.minRide - 4)
+            x.leakPerHour[C_RP] = 0, tb = x.t; // the air stops
+        if (tb && !tLift && x.starts > sb)
+            tLift = x.t;
+    });
+    printf("  bled by hand: RP %.1f -> lift starts %.1f s after the air stopped; RP %.1f a minute later\n", b.minRide - 4,
+           tLift ? (tLift - tb) / 1000.0f : -1.0f, b.h[C_RP]);
+    check(tLift && tLift - tb <= 6000 && b.h[C_RP] >= b.minRide, "S3", "a corner bled below min ride while parked is lifted within ~5 s");
 }
 
 // R3: load / unload compensation, small load ignored

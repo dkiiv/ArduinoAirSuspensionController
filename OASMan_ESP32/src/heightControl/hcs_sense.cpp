@@ -81,7 +81,7 @@ void Core::ingest(const Inputs &in)
             // valves moving air on this corner: readings are flow-affected, restart its windows
             k.busy = true;
             k.idleSince = now;
-            k.qOk = k.qPrev = false;
+            k.qOk = false;
             k.nh = k.ih = k.np = k.ip = k.ndh = k.ndp = 0;
         }
         else if (k.busy)
@@ -99,11 +99,11 @@ void Core::ingest(const Inputs &in)
         detectFaults(in, i);
         if (busy)
             continue;
-        // steadiness window: restarts after a movement / our own valve activity, and every 2 x HCS_CONFIRM_MS so a
-        // slow drift (a leak) cannot keep it from ever being steady
-        if (!k.qOk || k.qSince != lastMotion || (now - k.qStart) >= 2UL * HCS_CONFIRM_MS)
+        // steadiness: held inside HCS_STABLE_RANGE_H since qStart. Restarts after a movement / our own valve activity
+        // and whenever a reading leaves the band, so "steady for N s" counts from the moment the corner stopped moving
+        // (a slow leak's drift just restarts it)
+        if (!k.qOk || k.qSince != lastMotion || fmaxf_(k.qHi, x.h) - fminf_(k.qLo, x.h) > HCS_STABLE_RANGE_H)
         {
-            k.qPrev = k.qOk && k.qSince == lastMotion && (k.qHi - k.qLo) <= HCS_STABLE_RANGE_H; // carried: still = steady
             k.qLo = k.qHi = x.h;
             k.qSince = lastMotion;
             k.qStart = now;
@@ -248,8 +248,8 @@ void Core::motionDetect()
     }
 }
 
-// Has every healthy corner held inside HCS_STABLE_RANGE_H, with no movement / own valve activity, for confirmMs
-// (a window that ended steady carries over)? Returns the ms still needed, 0 when it has, 0xFFFFFFFF if it moved.
+// Has every healthy corner held inside HCS_STABLE_RANGE_H, with no movement / own valve activity, for confirmMs?
+// Returns the ms still needed (0 = yes), 0xFFFFFFFF when a corner has no reading since it last moved.
 uint32_t Core::steadyRemaining(uint32_t confirmMs) const
 {
     uint32_t need = 0;
@@ -258,10 +258,10 @@ uint32_t Core::steadyRemaining(uint32_t confirmMs) const
         const Corner &k = c[i];
         if (k.hFault)
             continue;
-        if (!k.qOk || (k.qHi - k.qLo) > HCS_STABLE_RANGE_H)
+        if (!k.qOk)
             return 0xFFFFFFFFUL;
         const uint32_t age = now - k.qStart;
-        if (!k.qPrev && age < confirmMs && confirmMs - age > need)
+        if (age < confirmMs && confirmMs - age > need)
             need = confirmMs - age;
     }
     return need;

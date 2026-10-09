@@ -329,8 +329,11 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
             c[i].pRef = pm[i];
 
     // ---- 7. confirmation: every corner steady with no motion for HCS_CONFIRM_MS (a dip / sag at speed moves the car),
-    //         or HCS_CONFIRM_LOAD_MS right after a detected disturbance (people / cargo)
-    const uint32_t confirmMs = (afterDisturb && (now - lastMotion) < 30000UL) ? HCS_CONFIRM_LOAD_MS : HCS_CONFIRM_MS;
+    //         or HCS_CONFIRM_LOAD_MS right after a detected disturbance (people / cargo) or for a min-ride lift
+    bool floorLift = false;
+    for (int i = 0; i < NC; i++)
+        floorLift = floorLift || (dir[i] > 0 && cls[i] == Cls::BOTTOM_GUARD);
+    const uint32_t confirmMs = ((afterDisturb && (now - lastMotion) < 30000UL) || floorLift) ? HCS_CONFIRM_LOAD_MS : HCS_CONFIRM_MS;
     const uint32_t left = pending ? steadyRemaining(confirmMs) : 0;
     if (left != 0)
     {
