@@ -83,7 +83,7 @@ void Core::begin(uint32_t t, const PersistBlob *r, bool sh, LogFn lf)
 {
     memset((void *)this, 0, sizeof(*this)); // POD members only; every non-zero default is set below
     now = bootAt = lastMotion = lastEvalAt = eventOpenSince = manualIdleSince = statsAt = lastPersistAt = t;
-    driveStartAt = steadySince = cruiseEvalAt = pulseEnd = t;
+    driveStartAt = steadySince = cruiseEvalAt = pulseEnd = oweAt = t;
     shadow = sh;
     logFn = lf;
     st = State::INIT;
@@ -442,6 +442,7 @@ void Core::tickManual(const Inputs &in)
         k.leakFault = k.leakAllowance = false;
         k.fastCount = 0;
         k.wantDir = 0;
+        k.owe = k.oweCand = 0;
         logf("COMMIT %s %s tgt=%.1f pRef=%.1f%s", CN[i], presetPending ? "preset" : "manual", k.tgt, k.pRef,
              k.floorOverride >= 0 ? " (user-held below min ride)" : "");
     }
@@ -513,6 +514,8 @@ void Core::startBatch(const Inputs &in, Outputs &out, const bool *inB, const int
         k.batchDir = dir[i];
         k.batchCls = cls[i];
         k.batchH0 = hm[i];
+        k.batchGoal = goal[i];
+        k.oweCand = 0;
         k.batchP0 = pOk[i] ? pm[i] : NAN;
         k.batchOpenMs = 0;
         k.valveOpenSince = now;
@@ -551,8 +554,17 @@ void Core::tickCorrecting(const Inputs &in, Outputs &out)
             return abortBatch(out, "sensor fault on a corrected corner", State::PARKED);
     // the corners NOT being corrected watch for motion (drive-off, someone getting in)
     abortRun = (lastStrong >= 1 || lastVoting >= 2) ? abortRun + 1 : 0;
+    if (abortRun == 0 && !inEpisode)
+        for (int i = 0; i < NC; i++)
+            if (c[i].inBatch)
+                c[i].liveH = in.c[i].h; // height is not flow-affected (pressure is); a pulling-away car squats
     if (inEpisode || abortRun >= HCS_ABORT_TICKS)
+    {
+        for (int i = 0; i < NC; i++)
+            if (c[i].inBatch && c[i].batchDir > 0)
+                c[i].oweCand = c[i].batchGoal - c[i].liveH; // what is still missing, from the last motion-free reading
         return abortBatch(out, "motion detected on the watching corners", State::MOTION);
+    }
     if (!batchSettling && (now - batchStart) > HCS_BATCH_WATCHDOG_MS)
         return abortBatch(out, "batch watchdog", State::PARKED);
     bool running = false;

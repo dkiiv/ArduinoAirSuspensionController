@@ -116,18 +116,15 @@
 #ifndef HCS_EXTERNAL_UNLOAD_FRAC
 #define HCS_EXTERNAL_UNLOAD_FRAC 0.35f
 #endif
-// Every correction must be wanted by two evaluations at least this far apart with no motion in between. A dip /
-// the bottom of a hill compresses all four corners for a second or two; a person or cargo stays.
+// Confirmation: a correction must persist this long with no motion -- either every corner has stayed within
+// HCS_STABLE_RANGE_H since the last movement for this long, or two evaluations this far apart both want it. A dip /
+// the bottom of a hill compresses all four corners for a second or two (and moves them); a person or cargo stays.
 #ifndef HCS_CONFIRM_MS
 #define HCS_CONFIRM_MS 10000
 #endif
 // An event (load, leak) keeps the load references frozen until resolved, at most this long.
 #ifndef HCS_EVENT_MAX_MS
 #define HCS_EVENT_MAX_MS 900000UL
-#endif
-// After a drive, an accepted target within this of the preset snaps back to the preset (no drift over trips).
-#ifndef HCS_ANCHOR_TOL
-#define HCS_ANCHOR_TOL 3.0f
 #endif
 // A correction that lands further than this from its target gets ONE completion attempt.
 #ifndef HCS_LAND_TOL
@@ -257,6 +254,38 @@
 #endif
 #ifndef HCS_CRUISE_MAX_PER_HOUR
 #define HCS_CRUISE_MAX_PER_HOUR 4
+#endif
+
+// ---- drive-away top-up: a fill the parked path wanted (load / leak) but the car drove off before it finished.
+// Decided while parked (steady readings), delivered as open-loop pulses in steady driving, never more than owed.
+#ifndef HCS_OWE_MIN_STEADY_MS
+#define HCS_OWE_MIN_STEADY_MS 5000 // the parked reading must have been steady this long to be owed
+#endif
+#ifndef HCS_OWE_MAX
+#define HCS_OWE_MAX 10.0f // height %: at most this much is ever delivered while driving, per corner
+#endif
+#ifndef HCS_OWE_PULSE_GAP_MS
+#define HCS_OWE_PULSE_GAP_MS 5000UL // between two drive-away pulses
+#endif
+// Load added just before driving off (nobody waited for the parked correction): recognised while driving from
+// drive-long averages -- total bag pressure up vs before the trip AND the level plane (twist removed) below the
+// preset. Slopes / leaks keep the total load, dips average out, heat raises the car: none of them qualify.
+#ifndef HCS_DRIVE_LOAD_MIN_MS
+#define HCS_DRIVE_LOAD_MIN_MS 60000UL // average at least this much driving first
+#endif
+#ifndef HCS_DRIVE_LOAD_MAX_MS
+#define HCS_DRIVE_LOAD_MAX_MS 900000UL // only early in a drive (afterwards the arrival evaluation handles it)
+#endif
+// "Calm" (drive-away pulses): every corner's 1-s average stayed inside HCS_OWE_CALM_H for HCS_OWE_CALM_MS. Turning
+// in / out, braking and accelerating move it; a long constant sweeper does not (a fill adds the same air either way).
+#ifndef HCS_OWE_CALM_MS
+#define HCS_OWE_CALM_MS 8000UL
+#endif
+#ifndef HCS_OWE_CALM_H
+#define HCS_OWE_CALM_H 2.0f // ESTIMATE: rough roads may need more (see STATS DRIVE)
+#endif
+#ifndef HCS_FILL_RATE_DEFAULT
+#define HCS_FILL_RATE_DEFAULT 2.0f // ESTIMATE: height % per second of open IN valve until learned from a parked fill
 #endif
 
 #endif

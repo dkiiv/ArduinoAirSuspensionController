@@ -155,6 +155,11 @@ private:
         bool hFault, pFault;
         int badH, badP;
         uint32_t goodSinceH, goodSinceP;
+        float lastH;           // last idle height sample
+        float liveH;           // during a correction: last height read before any sign of motion
+        bool qOk;              // steadiness since the last movement: height range [qLo, qHi] since qStart
+        float qLo, qHi;
+        uint32_t qStart, qSince;
         // what to hold and the evidence references (hcs_classify.cpp)
         bool tgtValid;
         float tgt, floorOverride;
@@ -179,7 +184,12 @@ private:
         Cls batchCls;
         float batchH0, batchP0;
         uint32_t batchOpenMs;
+        float batchGoal;
         float fillRate; // height % per second of open IN valve, learned from parked fills (cruise pulse sizing)
+        float sdH, sdP; // drive-long sums for the drive-away load check
+        float calmLo, calmHi;
+        float oweCand;  // fill the last parked evaluation wanted (height %), becomes owe when DRIVING is confirmed
+        float owe;      // drive-away top-up still to deliver (height %)
         // cruise (hcs_cruise.cpp)
         float hL, pL, hS, hC, pC;
         bool cruiseInit, cruiseRef, cruiseLow;
@@ -215,7 +225,12 @@ private:
     uint32_t batchT[HCS_MAX_BATCHES_PER_HOUR];
     int batchI;
     // cruise
-    uint32_t driveStartAt, steadySince, cruiseEvalAt, pulseEnd;
+    uint32_t driveStartAt, steadySince, cruiseEvalAt, pulseEnd, oweAt, driveLoadAt;
+    uint32_t sdN;
+    bool driveLoadDone, pulseOwe;
+    uint32_t calmSince, pulseStartAt, pulseMs;
+    float pulseStep;
+    int driveLoadCnt;
     bool steady;
     int pulseCorner;
     uint32_t pulseT[HCS_CRUISE_MAX_PER_HOUR];
@@ -256,8 +271,12 @@ private:
     Cls classify(const Inputs &in, int i, float hm, bool pOk, float pm, int loadDir, bool airElsewhere, int8_t airChg,
                  int8_t &dir, float &goal);
     const char *gate(const Inputs &in, int i, int8_t dir, bool pOk, float pm) const;
+    void retargetArrival(const Inputs &in, const float *hm);
+    uint32_t steadyRemaining() const; // 0 = every healthy corner steady for HCS_CONFIRM_MS; 0xFFFFFFFF = not steady
     // hcs_cruise.cpp
     void cruiseTick(const Inputs &in, Outputs &out);
+    bool oweTick(const Inputs &in, Outputs &out);
+    void driveLoadCheck(const Inputs &in);
 
     // helpers
     float floorBase(const Inputs &in, int i) const;

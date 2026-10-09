@@ -34,7 +34,7 @@ g++ -std=c++17 -O2 -DHCS_MOTION_H_THRESH=1.0f -DHCS_CONFIRM_MS=0 -o hcs_sim_test
 HCS_DUMP_FROM=790000 HCS_DUMP_TO=800000 ./hcs_sim S1
 ```
 
-Runtime: all scenarios together take a few seconds of wall time and cover ~40 simulated hours.
+Runtime: all scenarios together take about a second of wall time and cover ~45 simulated hours.
 
 ## The simulated car
 
@@ -74,11 +74,11 @@ Calibration is fixed at raw 10..90 with min ride 35. These are the gaps the fiel
 
 | Id | Scenario | Key checks |
 |---|---|---|
-| S1 | hill spot: crown + slope, phone connected 8 h, cooling, slow leak on a hanging corner | arrival is SHIFT on all four corners; hanging corners never dumped; compressed corners never pushed toward flat; leak refilled to the arrival height; no false leak latch |
+| S1 | hill spot: crown + slope, phone connected 8 h, cooling, slow leak on a hanging corner | arrival: targets rebuilt once (preset plane + crown twist), nothing corrected; hanging corners never dumped; compressed corners never pushed toward flat; leak refilled to the arrival height; no false leak latch |
 | S2 | 30 min mixed driving (sweepers, braking, highway, red lights), plus a blind-detector variant | zero actuation while moving |
 | S3 | overnight leak below min ride, no BLE, reboot at 5 h, owner returns at 8 h; plus a "nothing persisted" variant | nothing moves without BLE; RD lifted back to the preset (BOTTOM_GUARD + completion); driver load also compensated; only RD actuated |
 | S4 | two rear passengers, 10 kg groceries, passengers leave | rear lifted back; front untouched; groceries ignored; lowered back on UNLOAD |
-| S5 | drive off in the middle of a correction | abort within ~500 ms |
+| S5 | drive off in the middle of a correction | abort within ~500 ms; the unfinished part is owed and topped up while driving |
 | S6 | load with no BLE client, then the client connects | VETO while absent; corrected after |
 | S7 | RD height wire break, then a second sensor | corner frozen; global FAULT with two |
 | S8 | car jacked at RP with the phone connected | EXTERNAL freeze; nothing moves; clears afterwards |
@@ -91,6 +91,7 @@ Calibration is fixed at raw 10..90 with min ride 35. These are the gaps the fiel
 | S15 | 4 h road trip with RD leaking 2.5 %/h | cruise pulses on RD only, never during a corner or brake; RD within 2 % of the others |
 | S16 | dips and the bottom of hills at speed: normal road, glass-smooth road, long highway sags; then real load after parking | no fill, dump or pulse in any case; the confirmation rule exercised and holding; weight after parking still compensated |
 | S17 | the shadow build: leak plus load for 2 h, phone connected | logs `SHADOW would START`; zero actuation; no leak bookkeeping from decisions that never ran |
+| S18 | get in and drive from the hill spot: no BLE overnight, trunk + passenger loaded with the car off, controller connects when the driver sits, drive off 8 s later; arrive on flat ground, or back on the crown; plus a "nobody drives off" variant | level plane back at the preset (twist removed) within the deadband after arrival; the crown's twist kept at home; prints the drive-away pulses and how fast the parked correction starts |
 
 (S12, the valve/sensor cross-wiring scenario, was removed together with that check.)
 

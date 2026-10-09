@@ -119,6 +119,35 @@ const char *Core::gate(const Inputs &in, int i, int8_t dir, bool pOk, float pm) 
     return nullptr;
 }
 
+// After a drive the old targets belong to the old parking spot. The new ones are the preset's plane (heave, pitch,
+// roll: what the user asked for) plus THIS spot's twist. Twist (FP + RD - FD - RP) is what uneven ground does to a
+// rigid car -- a crown puts one diagonal up and the other down -- and it is never corrected. Load (people, cargo)
+// and leaks change the plane, so they still show up against these targets.
+void Core::retargetArrival(const Inputs &in, const float *hm)
+{
+    static const float TW[NC] = {+1, -1, -1, +1}; // FP RP FD RD
+    float ref[NC], wRef = 0, wCur = 0;
+    for (int i = 0; i < NC; i++)
+    {
+        if (c[i].hFault || !c[i].tgtValid)
+            return; // twist needs all four corners
+        ref[i] = presetValid ? (float)presetH[i] : c[i].tgt;
+        wRef += 0.25f * TW[i] * ref[i];
+        wCur += 0.25f * TW[i] * hm[i];
+    }
+    for (int i = 0; i < NC; i++)
+    {
+        Corner &k = c[i];
+        if (k.floorOverride >= 0)
+            continue; // user holds it low on purpose
+        k.tgt = fminf_(fmaxf_(ref[i] + TW[i] * (wCur - wRef), liftTarget(in, i)), ceilH());
+        k.owe = 0; // the parked path takes over from the drive-away top-up
+    }
+    logf("ARRIVAL targets = preset plane + this spot's twist %+.1f: FP %.1f RP %.1f FD %.1f RD %.1f", wCur, c[C_FP].tgt, c[C_RP].tgt,
+         c[C_FD].tgt, c[C_RD].tgt);
+    markPersist(false);
+}
+
 void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arrival)
 {
     // ---- 1. settled readings for every healthy corner, or postpone
@@ -190,6 +219,8 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
         logf("EXTERNAL cleared");
         externalFreeze = false;
     }
+    if (arrival)
+        retargetArrival(in, hm);
     const bool periodic = strcmp(kind, "PERIODIC") == 0;
     if (periodic)
         logq("EVAL %s load=%+.1f%% (%s, n=%d) pres=%d", kind, load * 100.0f, LN[loadDir], nl, in.presence ? 1 : 0);
@@ -211,7 +242,7 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
             airChg[i] = +1, nGain++;
     }
 
-    // ---- 5. classify; accept terrain; re-anchor on the preset after a drive
+    // ---- 5. classify; accept terrain
     Cls cls[NC];
     int8_t dir[NC];
     float goal[NC];
@@ -237,10 +268,7 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
         if (cls[i] == Cls::SHIFT)
         {
             // the surface the car is standing on: accept it as the new target, never fight it
-            float nt = fminf_(hm[i], ceilH());
-            if (arrival && presetValid && fabsf(nt - presetH[i]) <= HCS_ANCHOR_TOL && fabsf(nt - presetH[i]) < fabsf(oldTgt - presetH[i]))
-                nt = presetH[i]; // back on (near) flat ground
-            k.tgt = nt;
+            k.tgt = fminf_(hm[i], ceilH());
             if (pOk[i])
             {
                 k.pRef = k.airP = pm[i];
@@ -248,10 +276,14 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
             }
             markPersist(false);
         }
-        else if (arrival && presetValid && cls[i] != Cls::AMBIGUOUS && cls[i] != Cls::BOTTOM_GUARD && cls[i] != Cls::CEILING &&
-                 fabsf(k.tgt - presetH[i]) <= HCS_ANCHOR_TOL && k.tgt != presetH[i])
+        if (arrival && cls[i] == Cls::WITHIN && k.floorOverride < 0)
         {
-            k.tgt = presetH[i]; // pull a non-terrain reference back onto the preset after a drive
+            k.tgt = fminf_(hm[i], ceilH()); // close to the preset plane: hold exactly where it arrived (anchored every arrival)
+            if (pOk[i])
+            {
+                k.airH = hm[i]; // the sign test only works against a reference taken on THIS spot
+                k.airP = pm[i];
+            }
             markPersist(false);
         }
         if (cls[i] == Cls::AIR_LOSS || cls[i] == Cls::LOAD || cls[i] == Cls::UNLOAD)
@@ -294,15 +326,20 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
         if (reref[i] && (!eventOpen || forceReref))
             c[i].pRef = pm[i];
 
-    // ---- 7. confirmation: the same correction wanted twice, >= HCS_CONFIRM_MS apart, no motion in between
+    // ---- 7. confirmation: steady since the last movement for HCS_CONFIRM_MS, or wanted twice that far apart.
+    //         A fill wanted on a steady reading is remembered (oweCand) in case the car drives off first.
+    const uint32_t steadyLeft = steadyRemaining();
     for (int i = 0; i < NC; i++)
     {
         Corner &k = c[i];
+        k.oweCand = 0;
         if (dir[i] == 0)
         {
             k.wantDir = 0;
             continue;
         }
+        if (dir[i] > 0 && steadyLeft != 0xFFFFFFFFUL && (HCS_CONFIRM_MS - (steadyLeft < HCS_CONFIRM_MS ? steadyLeft : HCS_CONFIRM_MS)) >= HCS_OWE_MIN_STEADY_MS)
+            k.oweCand = goal[i] - hm[i];
         if (k.completeCls != Cls::NONE && cls[i] == k.completeCls)
             continue; // a completion was confirmed with the original correction
         if (k.wantDir != dir[i] || k.wantEpisode != episodeId)
@@ -312,10 +349,11 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
             k.wantEpisode = episodeId;
         }
         const uint32_t age = now - k.wantSince;
-        if (age < HCS_CONFIRM_MS)
+        if (age < HCS_CONFIRM_MS && steadyLeft != 0)
         {
-            logq("  %s %s: wanted, confirming in %lus", CN[i], clsName(cls[i]), (unsigned long)((HCS_CONFIRM_MS - age) / 1000));
-            const uint32_t due = now + (HCS_CONFIRM_MS - age) + 100;
+            const uint32_t left = (HCS_CONFIRM_MS - age) < steadyLeft ? (HCS_CONFIRM_MS - age) : steadyLeft;
+            logq("  %s %s: wanted, confirming in %lus", CN[i], clsName(cls[i]), (unsigned long)((left + 999) / 1000));
+            const uint32_t due = now + left + 100;
             if (confirmAt == 0 || (int32_t)(due - confirmAt) < 0)
                 confirmAt = due;
             dir[i] = 0;

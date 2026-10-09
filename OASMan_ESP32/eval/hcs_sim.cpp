@@ -484,13 +484,15 @@ static void scenarioHill()
     s.rough = 0;
     s.moving = false;
     size_t mark = g_log.size();
+    const int startsAtArrival = s.starts;
     s.run(240);
     float arr[4];
     for (int i = 0; i < 4; i++)
         arr[i] = s.h[i];
     printf("  arrival heights FP=%.1f RP=%.1f FD=%.1f RD=%.1f (FP/RD compressed, RP/FD hanging)\n", arr[0], arr[1], arr[2], arr[3]);
     check(s.startsWhileMoving == 0 && s.valveMsWhileMoving == 0, "S1", "no valve activity while driving");
-    check(countLog("SHIFT", mark) >= 4, "S1", fmt("arrival classified as terrain SHIFT on all 4 corners (%d SHIFT lines)", countLog("SHIFT", mark)));
+    check(s.starts == startsAtArrival && countLog("ARRIVAL targets", mark) == 1, "S1",
+          fmt("arrival on the crown: targets rebuilt once, nothing corrected (%d starts)", s.starts - startsAtArrival));
     int startsBefore = s.starts;
     // cool down over 3 h (6 % of gas temperature)
     s.run(3 * 3600, [](Sim &x) { if (x.T > 0.97f) x.T -= 0.06f / (3600 * 10); });
@@ -952,6 +954,76 @@ static void scenarioShadow()
     check(countLog("FAST leak latched") == 0 && countLog("LEAK RD refill") == 0, "S17", "no leak bookkeeping from decisions that never ran");
 }
 
+// Get in and drive from the hill spot: no BLE overnight; trunk loaded and passengers get in while the car is off;
+// the controller connects when the driver sits; drive off quickly; arrive on flat ground (or back home).
+static void scenarioGetInAndDrive()
+{
+    printf("\nS18 get in and drive from the hill spot (BLE only once the driver sits), arrive on flat ground / back home\n");
+    for (int dest = 0; dest < 3; dest++)
+    {
+        Sim s;
+        g_log.clear();
+        parkedAtPreset(s);
+        s.drive(300, 0.6f);
+        s.drive(8, 0.3f, false);
+        s.run(8, [](Sim &x) { x.warp += 9.0f / 80; x.pitch += 0.04f / 80; }); // park on the crown
+        s.run(600);
+        s.presence = false; // owner leaves; overnight
+        s.run(3600);
+        // morning, car off: 20 kg in the trunk, one passenger in the rear (driver side)
+        s.disturbance(5);
+        s.extraF[C_RP] += 0.06f;
+        s.extraF[C_RD] += 0.06f;
+        s.run(20);
+        s.disturbance(5);
+        s.extraF[C_RD] += 0.14f;
+        s.run(5);
+        // driver gets in (FD), car powers up, the in-car controller connects
+        s.disturbance(5);
+        s.extraF[C_FD] += 0.16f;
+        s.presence = true;
+        const uint32_t seated = s.t;
+        const int st0 = s.starts;
+        if (dest == 2)
+        {
+            // nobody drives off: how fast is the parked correction?
+            uint32_t firstStart = 0;
+            s.run(120, [&](Sim &x) {
+                if (!firstStart && x.starts > st0)
+                    firstStart = x.t;
+            });
+            printf("  parked, nobody drives off: first correction started %.0f s after the driver sat down; RP %.1f RD %.1f FD %.1f\n",
+                   firstStart ? (firstStart - seated) / 1000.0f : -1.0f, s.h[C_RP], s.h[C_RD], s.h[C_FD]);
+            continue;
+        }
+        s.run(8); // pull away 8 s after sitting down
+        const int pulses0 = s.pulses;
+        // 15 min drive, ending either on flat ground or back on the crown
+        if (dest == 0)
+            s.run(4, [](Sim &x) { x.warp -= 9.0f / 40; x.pitch -= 0.04f / 40; });
+        s.drive(900, 0.6f);
+        s.drive(8, 0.3f, false);
+        s.run(300);
+        const float wp = 0.25f * (s.h[C_FP] + s.h[C_RD] - s.h[C_FD] - s.h[C_RP]);
+        printf("  %s: drive-away pulses %d (RP %d RD %d FD %d FP %d); after arrival FP %.1f RP %.1f FD %.1f RD %.1f (twist %+.1f)\n",
+               dest == 0 ? "arrive on flat ground" : "arrive back home on the crown", s.pulses - pulses0, s.pulsesOn[C_RP], s.pulsesOn[C_RD],
+               s.pulsesOn[C_FD], s.pulsesOn[C_FP], s.h[C_FP], s.h[C_RP], s.h[C_FD], s.h[C_RD], wp);
+        float plane[4];
+        {
+            // plane part of the heights (twist removed) vs the preset plane (50 everywhere)
+            const float sg[4] = {+1, -1, -1, +1};
+            for (int i = 0; i < 4; i++)
+                plane[i] = s.h[i] - sg[i] * wp;
+        }
+        float worst = 0;
+        for (int i = 0; i < 4; i++)
+            worst = fmaxf(worst, fabsf(plane[i] - 50));
+        check(worst <= HCS_DEADBAND_H + 0.5f, "S18", fmt("%s: car level to the preset apart from the ground's twist (worst %.1f)", dest == 0 ? "flat" : "crown", worst));
+        if (dest == 1)
+            check(fabsf(wp) > 4.0f, "S18", fmt("back home: the crown's twist is left alone (%.1f)", wp));
+    }
+}
+
 int main(int argc, char **argv)
 {
     // usage: hcs_sim [-v] [S<n> ...]   (-v = print the HCS decision log; S<n> = run only those scenarios)
@@ -971,7 +1043,8 @@ int main(int argc, char **argv)
                      {"S5", scenarioDriveOffMidFill}, {"S6", scenarioNoPresence}, {"S7", scenarioFaults},  {"S8", scenarioJack},
                      {"S9", scenarioManual},     {"S10", scenarioFastLeak},   {"S11", scenarioLowPreset},   {"S11b", scenarioShowMode},
                      {"S13", scenarioCoupling},  {"S14", scenarioOwnersLeak}, {"S15", scenarioRoadTrip},    {"S16", scenarioDips},
-                     {"S17", scenarioShadow}};
+                     {"S17", scenarioShadow},
+                     {"S18", scenarioGetInAndDrive}};
     for (const auto &sc : all)
     {
         bool run = only.empty();

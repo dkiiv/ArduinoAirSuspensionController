@@ -81,6 +81,7 @@ void Core::ingest(const Inputs &in)
             // valves moving air on this corner: readings are flow-affected, restart its windows
             k.busy = true;
             k.idleSince = now;
+            k.qOk = false;
             k.nh = k.ih = k.np = k.ip = k.ndh = k.ndp = 0;
         }
         else if (k.busy)
@@ -98,6 +99,19 @@ void Core::ingest(const Inputs &in)
         detectFaults(in, i);
         if (busy)
             continue;
+        k.lastH = k.liveH = x.h;
+        if (!k.qOk || k.qSince != lastMotion)
+        {
+            k.qLo = k.qHi = x.h; // restart: first sample after a movement / our own valve activity
+            k.qSince = lastMotion;
+            k.qStart = now;
+            k.qOk = true;
+        }
+        else
+        {
+            k.qLo = fminf_(k.qLo, x.h);
+            k.qHi = fmaxf_(k.qHi, x.h);
+        }
 
         k.wh[k.ih] = x.h;
         k.ih = (k.ih + 1) % HCS_WINDOW;
@@ -225,6 +239,22 @@ void Core::motionDetect(const Inputs &in, uint32_t dt)
             }
             logf("DRIVING confirmed (motion for %lus) -> parked corrections vetoed; re-baseline on arrival",
                  (unsigned long)((now - episodeStart) / 1000));
+            for (int i = 0; i < NC; i++)
+            {
+                Corner &k = c[i];
+                if (k.oweCand > HCS_LAND_TOL)
+                {
+                    k.owe = fminf_(fmaxf_(k.owe, k.oweCand), HCS_OWE_MAX);
+                    logf("DRIVE-AWAY %s: parked fill not done, owes %.1f%% -> top up in steady driving", CN[i], k.owe);
+                }
+                k.oweCand = 0;
+            }
+            oweAt = driveLoadAt = now;
+            driveLoadDone = false;
+            driveLoadCnt = 0;
+            sdN = 0;
+            for (int i = 0; i < NC; i++)
+                c[i].sdH = c[i].sdP = 0;
         }
     }
     else if (inEpisode && (now - lastMotion) >= HCS_EPISODE_GAP_MS)
@@ -294,6 +324,25 @@ void Core::statsFlush()
     memset(stP, 0, sizeof(stP));
     for (int i = 0; i < NC; i++)
         sqN[i] = sqH[i] = sqH2[i] = sqP[i] = sqP2[i] = 0;
+}
+
+// Has every healthy corner stayed inside HCS_STABLE_RANGE_H since the last movement (or our own valve activity),
+// for HCS_CONFIRM_MS? Returns the ms still needed, 0 when it has, 0xFFFFFFFF when a corner moved too much.
+uint32_t Core::steadyRemaining() const
+{
+    uint32_t need = 0;
+    for (int i = 0; i < NC; i++)
+    {
+        const Corner &k = c[i];
+        if (k.hFault)
+            continue;
+        if (!k.qOk || (k.qHi - k.qLo) > HCS_STABLE_RANGE_H)
+            return 0xFFFFFFFFUL;
+        const uint32_t age = now - k.qStart;
+        if (age < HCS_CONFIRM_MS && HCS_CONFIRM_MS - age > need)
+            need = HCS_CONFIRM_MS - age;
+    }
+    return need;
 }
 
 } // namespace hcs

@@ -47,7 +47,15 @@ void Core::cruiseTick(const Inputs &in, Outputs &out)
         k.hL += aL * (in.c[i].h - k.hL);
         k.pL += aL * (in.c[i].p - k.pL);
         k.hS += aS * (in.c[i].h - k.hS);
+        if (driving)
+        {
+            k.sdH += in.c[i].h;
+            k.sdP += in.c[i].p;
+        }
     }
+    if (driving && allInit)
+        sdN++;
+    driveLoadCheck(in);
     bool st_ = false;
     if (allInit)
     {
@@ -61,13 +69,29 @@ void Core::cruiseTick(const Inputs &in, Outputs &out)
     if (st_ && !steady)
         steadySince = now;
     steady = st_;
+    bool calmOk = allInit;
+    for (int i = 0; i < NC && calmOk; i++)
+    {
+        Corner &k = c[i];
+        if (k.hFault || k.busy)
+            continue; // the pulsed corner moves on purpose
+        k.calmLo = fminf_(k.calmLo, k.hS);
+        k.calmHi = fmaxf_(k.calmHi, k.hS);
+        calmOk = (k.calmHi - k.calmLo) <= HCS_OWE_CALM_H;
+    }
+    if (!calmOk)
+    {
+        calmSince = now;
+        for (int i = 0; i < NC; i++)
+            c[i].calmLo = c[i].calmHi = c[i].hS;
+    }
 
     // ---- a pulse in flight: end it on time, or the moment anything is not right
     if (pulseCorner >= 0)
     {
         const char *why = !in.presence                                  ? "BLE presence lost"
                           : (!in.enabled || in.safetyMode)             ? "supervisor disabled"
-                          : !steady                                     ? "roll / pitch excursion"
+                          : (pulseOwe ? !calmOk : !steady)              ? "roll / pitch excursion"
                           : (c[pulseCorner].hFault || c[pulseCorner].pFault) ? "sensor fault"
                                                                         : nullptr;
         if (why || (int32_t)(now - pulseEnd) >= 0)
@@ -75,12 +99,21 @@ void Core::cruiseTick(const Inputs &in, Outputs &out)
             out.cmd = Cmd::ABORT;
             out.g[pulseCorner].active = true;
             if (why)
-                logf("CRUISE pulse %s cut short: %s", CN[pulseCorner], why);
+            {
+                logf("%s pulse %s cut short: %s", pulseOwe ? "DRIVE-AWAY" : "CRUISE", CN[pulseCorner], why);
+                if (pulseOwe && pulseMs > 0 && (now - pulseStartAt) < pulseMs)
+                    c[pulseCorner].owe += pulseStep * (1.0f - (float)(now - pulseStartAt) / (float)pulseMs); // not delivered
+            }
             pulseCorner = -1;
+            sdN = 0; // the car changed on purpose: restart the drive-long averages
+            for (int i = 0; i < NC; i++)
+                c[i].sdH = c[i].sdP = 0;
         }
         return;
     }
 
+    if (oweTick(in, out))
+        return;
     if (!HCS_CRUISE_TOPUP || !driving || (now - driveStartAt) < HCS_CRUISE_MIN_DRIVE_MS || (now - cruiseEvalAt) < 10000UL)
         return;
     cruiseEvalAt = now;
@@ -170,10 +203,114 @@ void Core::cruiseTick(const Inputs &in, Outputs &out)
     out.g[best].pulseMs = (uint16_t)ms;
     out.g[best].ceilP = in.bagCeilPsi - HCS_BAG_P_MARGIN;
     pulseCorner = best;
+    pulseOwe = false;
     pulseEnd = now + ms;
     logf("CRUISE top-up %s: losing air for %lus, steady %lus -> fill pulse %lu ms (~%.1f%%, rate %s)", CN[best],
          (unsigned long)((now - k.cruiseLowSince) / 1000), (unsigned long)((now - steadySince) / 1000), (unsigned long)ms,
          HCS_CRUISE_STEP, finite_(k.fillRate) ? "learned" : "default");
+}
+
+// Load added right before driving off: decide it from the drive-long means (see HCS_DRIVE_LOAD_*), owe the plane
+// deficit to the low corners, deliver it with oweTick. Once per drive.
+void Core::driveLoadCheck(const Inputs &in)
+{
+    if (!driving || driveLoadDone || (now - driveStartAt) < HCS_DRIVE_LOAD_MIN_MS || (now - driveLoadAt) < 10000UL)
+        return;
+    driveLoadAt = now;
+    if ((now - driveStartAt) > HCS_DRIVE_LOAD_MAX_MS)
+    {
+        driveLoadDone = true;
+        return;
+    }
+    if (sdN < HCS_DRIVE_LOAD_MIN_MS / HCS_TICK_MS || heightFaultCount() > 0 || externalFreeze || !in.enabled)
+        return; // (sdN restarts after every pulse)
+    static const float TW[NC] = {+1, -1, -1, +1};
+    float hmean[NC], ref[NC], load = 0, wRef = 0, wCur = 0;
+    for (int i = 0; i < NC; i++)
+    {
+        const Corner &k = c[i];
+        if (k.pFault || k.owe > 0.5f || !k.tgtValid || !finite_(k.pRef))
+            return; // owed already (parked decision) or no load reference
+        hmean[i] = k.sdH / sdN;
+        load += 0.25f * ((k.sdP / sdN) - k.pRef) / fmaxf_(finite_(k.pScale) ? k.pScale : k.pRef, HCS_PREF_MIN_PSI);
+        ref[i] = presetValid ? (float)presetH[i] : k.tgt;
+        wRef += 0.25f * TW[i] * ref[i];
+        wCur += 0.25f * TW[i] * hmean[i];
+    }
+    float d[NC], worst = 0;
+    for (int i = 0; i < NC; i++)
+    {
+        d[i] = (ref[i] - TW[i] * wRef) - (hmean[i] - TW[i] * wCur); // > 0: the level plane is low at this corner
+        worst = fmaxf_(worst, d[i]);
+    }
+    const bool low = load > HCS_LOAD_FRAC && worst > HCS_DEADBAND_H;
+    driveLoadCnt = low ? driveLoadCnt + 1 : 0;
+    if (driveLoadCnt < 3)
+        return; // must hold for 3 checks (30 s)
+    driveLoadDone = true;
+    for (int i = 0; i < NC; i++)
+        if (d[i] > HCS_LAND_TOL && c[i].floorOverride < 0)
+            c[i].owe = fminf_(d[i], HCS_OWE_MAX);
+    logf("DRIVE LOAD: load %+.1f%% since parking, level plane low by FP %.1f RP %.1f FD %.1f RD %.1f -> top up in steady driving",
+         load * 100.0f, d[C_FP], d[C_RP], d[C_FD], d[C_RD]);
+}
+
+// Drive-away top-up: deliver what a parked evaluation decided (load / leak, on steady readings) but could not finish
+// before the car drove off. Fill-only, open-loop, never more than owed; the parked path checks the result on arrival.
+// Returns true when it handled this tick (pulse started or refused), so the leak logic waits.
+bool Core::oweTick(const Inputs &in, Outputs &out)
+{
+    if (!driving || (now - oweAt) < HCS_OWE_PULSE_GAP_MS)
+        return false;
+    int best = -1;
+    for (int i = 0; i < NC; i++)
+        if (c[i].owe > 0.5f && (best < 0 || c[i].owe > c[best].owe))
+            best = i;
+    if (best < 0)
+        return false;
+    oweAt = now;
+    Corner &k = c[best];
+    const float p = k.cruiseInit ? k.pL : in.c[best].p;
+    const char *no = !in.presence                                             ? "no BLE client"
+                     : (!in.enabled || in.safetyMode || externalFreeze)        ? "supervisor disabled / frozen"
+                     : (k.hFault || k.pFault)                                  ? "sensor fault"
+                     : (now - calmSince) < HCS_OWE_CALM_MS                     ? nullptr
+                     : (k.leakFault && !k.leakAllowance)                      ? "fast leak latched"
+                     : (!tankValid || tank < p + HCS_TANK_HEADROOM_PSI)       ? "waiting for tank headroom"
+                     : p >= in.bagCeilPsi - HCS_BAG_P_MARGIN                   ? "bag pressure ceiling"
+                     : k.hS + 1.0f > ceilH()                                  ? "ceiling"
+                                                                               : "";
+    if (!no)
+        return true; // not steady yet: wait quietly
+    if (*no)
+    {
+        logq("DRIVE-AWAY %s top-up refused: %s", CN[best], no);
+        return true;
+    }
+    const float step = fminf_(k.owe, HCS_CRUISE_STEP);
+    const float rate = (finite_(k.fillRate) && k.fillRate > 0.1f) ? k.fillRate : HCS_FILL_RATE_DEFAULT;
+    uint32_t ms = (uint32_t)(0.85f * step / rate * 1000.0f);
+    ms = ms < 100 ? 100 : (ms > HCS_CRUISE_PULSE_MAX_MS ? HCS_CRUISE_PULSE_MAX_MS : ms);
+    k.owe -= step;
+    if (shadow)
+    {
+        logf("SHADOW would DRIVE-AWAY top-up %s: %lu ms", CN[best], (unsigned long)ms);
+        return true;
+    }
+    out.cmd = Cmd::PULSE;
+    out.g[best].active = true;
+    out.g[best].dir = +1;
+    out.g[best].pulseMs = (uint16_t)ms;
+    out.g[best].ceilP = in.bagCeilPsi - HCS_BAG_P_MARGIN;
+    pulseCorner = best;
+    pulseOwe = true;
+    pulseStartAt = now;
+    pulseMs = ms;
+    pulseStep = step;
+    pulseEnd = now + ms;
+    logf("DRIVE-AWAY top-up %s: fill pulse %lu ms (~%.1f%%, rate %s), %.1f%% still owed", CN[best], (unsigned long)ms, step,
+         finite_(k.fillRate) ? "learned" : "default", k.owe > 0 ? k.owe : 0.0f);
+    return true;
 }
 
 } // namespace hcs

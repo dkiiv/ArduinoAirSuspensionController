@@ -3,14 +3,14 @@
 Automatic ride-height holding for **height-sensor mode**:
 - holds the preset;
 - refills leaks, including a corner that leaked below min ride;
-- lifts the car back after weight is added;
+- lifts the car back after weight is added, also when you drive off before it could;
 - leaves the car alone on uneven parking spots;
-- never acts while the car is driving;
+- never runs a closed-loop correction while driving;
 - tops up a slow leak during long drives.
 
 It is built for a car whose only knowledge of the world is four height sensors, four bag pressures, tank pressure, valve/compressor state and "is a BLE client connected". There is no speed, gear, door or IMU signal; everything is inferred.
 
-Status: **compiles (all envs), 61/61 bench-simulator checks pass, NOT yet run on a car.** Thresholds marked ESTIMATE in `hcs_config.h` must be measured first; see [hcs-field-data.md](hcs-field-data.md).
+Status: **compiles (all envs), 64/64 bench-simulator checks pass (18 scenarios), NOT yet run on a car.** Thresholds marked ESTIMATE in `hcs_config.h` must be measured first; see [hcs-field-data.md](hcs-field-data.md).
 
 Bench simulator: [hcs-simulator.md](hcs-simulator.md).
 
@@ -35,10 +35,10 @@ wheel tasks (existing)                     supervisor task (new, 10 Hz)
 | `hcs_core.h/.cpp` | types, state machine, user override, running a correction, persistence, logging |
 | `hcs_sense.cpp` | sample intake, electrical sensor faults, motion detector, STATS |
 | `hcs_classify.cpp` | evaluation: classify each corner, arbitrate, start one correction |
-| `hcs_cruise.cpp` | cruise top-up (slow leak while driving) |
+| `hcs_cruise.cpp` | while driving: drive-away top-up (load added just before leaving) and cruise top-up (slow leak) |
 | `heightControlSupervisor.cpp` | ESP32 adapter: builds inputs, executes commands, NVS, diag dump |
 
-The core has no Arduino includes; `eval/hcs_sim.cpp` compiles the same files on a PC. Cost when compiled in: about 2.9 KB RAM and 23 KB flash. The core does a few hundred float operations per 100 ms tick, which is negligible on an ESP32.
+The core has no Arduino includes; `eval/hcs_sim.cpp` compiles the same files on a PC. Cost when compiled in: about 3.1 KB RAM and 26 KB flash. The core does a few hundred float operations per 100 ms tick, which is negligible on an ESP32.
 
 ## 2. States
 
@@ -46,7 +46,7 @@ The core has no Arduino includes; `eval/hcs_sim.cpp` compiles the same files on 
 |---|---|---|
 | INIT | first 10 s after boot, buffers filling | no |
 | INACTIVE | not height mode, maintain off, or safety mode | no |
-| MOTION | a motion episode is in progress (driving or a disturbance) | no (cruise top-up only, see 6) |
+| MOTION | a motion episode is in progress (driving or a disturbance) | no (only the open-loop top-ups of section 6) |
 | SETTLING | quiet, but not long enough yet: 120 s after a drive or boot, 8 s after a disturbance | no |
 | PARKED | evaluated; re-evaluates every 30 s, on events, and when a confirmation is due | may start a correction |
 | CORRECTING | one correction in flight, then 6 s settle and a result check | its own |
@@ -84,9 +84,12 @@ Physics: bag pressure carries the corner's load, and air mass sets the height at
 | contradicting evidence, or no reference | AMBIGUOUS / SHIFT | never pump |
 
 Supporting rules:
-- **Confirmation.** A correction only starts if two evaluations at least 10 s apart want it, with no motion episode in between. A dip or the bottom of a hill at speed compresses all four corners for a second or two; a person or cargo stays. (Bench: with this rule disabled, a long highway sag on a glass-smooth road triggers fills. With it, none.)
+- **Arrival targets.** After a drive the old targets belong to the old parking spot. The new ones are rebuilt as the **preset's level plane** (heave, pitch, roll: what you asked for) **plus this spot's twist** (FP + RD - FD - RP).
+  - Uneven ground such as a crown is pure twist on a rigid car (one diagonal up, the other down), so it is kept and never corrected, and never carried to the next spot.
+  - Load and leaks change the plane, so they still show up.
+  - Corners within the deadband of these targets are then held exactly where they arrived, with a fresh air reference for this spot.
+- **Confirmation.** A correction only starts once it has persisted 10 s with no motion: either every corner has stayed within 1.5 % since the last movement for 10 s, or two evaluations 10 s apart both want it. A dip or the bottom of a hill at speed compresses all four corners for a second or two (and moves them); a person or cargo stays. (Bench: with confirmation disabled, a long highway sag on a glass-smooth road triggers fills. With it, none.)
 - **Event latch.** While any correction is pending, the load references stay frozen, so correcting the first loaded corner cannot erase the evidence for the second.
-- **Preset anchor.** After a drive, a target within 3 % of the preset snaps back to it, so the reference cannot wander over many trips.
 - **Completion pass.** A correction that lands more than 1 % short (routine timeout, tank) gets one follow-up.
 - **User-held low corners.** A corner the user put below min ride (show preset, stance) is held there, never lifted.
 
@@ -111,9 +114,26 @@ Supporting rules:
 - Fills are fill-only and dumps are dump-only, so a correction never overshoots and comes back.
 - Any motion on the watching corners aborts the correction within ~300 ms.
 
-## 6. Cruise top-up (slow leak on a long drive)
+## 6. Top-ups while driving
 
-The parked path never acts while driving. For a slow leak on a road trip:
+The parked, closed-loop path never acts while driving. Two open-loop, fill-only paths do, both with pulses of at most 1.5 s on one corner at a time. Each is cut short the moment the car stops being calm or steady, and the valve deadline is enforced in the wheel's own loop.
+
+### 6a. Drive-away top-up (load added right before leaving)
+
+With the in-car controller as the BLE client, nothing can happen until the driver sits down. People and cargo usually go in at the same moment, and you often pull away before the parked correction (about 10 s after the last movement) has run. What is owed is delivered while driving:
+
+- **Decided parked.** A fill that the last parked evaluation wanted on steady readings, or a fill cut short by the drive-off (from the last height read before the car moved), becomes **owed** when DRIVING is confirmed.
+- **Decided while driving** (load nobody evaluated). From 60 s into the drive, drive-long averages (restarted after every pulse) are checked every 10 s. It fires once per drive when both hold for 30 s:
+  - total bag pressure is up versus before the trip (more than 1.5 % load);
+  - the level plane, with the twist removed, is low by more than the deadband.
+
+  The plane deficit per corner is owed. Slopes and leaks keep the total load, dips average out, and heat raises the car, so none of them qualify.
+- **Delivery.** At most 2 % per pulse, sized from the corner's learned fill rate (or 2 %/s, ESTIMATE, until a parked fill teaches it). Pulses go only when every corner's 1-s average has stayed within 2 % for 8 s: turning in or out, braking and accelerating all break that. Never more than owed, and at most 10 % per corner. A cut-short pulse is credited only for the time it ran.
+- **On arrival** the parked path checks the result against the new spot's targets.
+
+### 6b. Cruise top-up (slow leak on a long drive)
+
+For a slow leak on a road trip:
 
 - **When it can act:** after 10 min of driving, using 2-minute averages of each corner's height and pressure.
 - **Signature** (rigid body):
@@ -130,7 +150,7 @@ The parked path never acts while driving. For a slow leak on a road trip:
 ## 7. Scenarios
 
 **Hill spot, 3 a.m., slow leak, phone connected.**
-1. On arrival every corner is SHIFT (terrain): the crown geometry becomes the target, and no valve moves.
+1. On arrival the targets become the preset plane plus the crown's twist (`ARRIVAL targets ... twist -9`); every corner is held where it arrived, and no valve moves.
 2. Cooling sags all corners a little; a corner past 3 % is refilled to its *arrival* height, so the compressed corners stay compressed.
 3. A slowly leaking corner is refilled to its arrival height every few hours, logging its leak rate each time.
 
@@ -154,7 +174,19 @@ Bench S16: 15 min of sharp dips (normal and glassy) and long highway sags, with 
 
 Bench S3: overnight leak with no BLE and a reboot at 5 h. Nothing moves while the phone is away; when it connects, RD 34.4 -> 49.7 and the driver's load on FD is also compensated.
 
-**Weight added.** Two adults into the rear seats: a disturbance, then 8 s quiet, then L up, LOAD, confirmed 10 s later, and the rear axle goes back to preset. 10 kg of groceries stays inside the deadband. When the passengers leave: UNLOAD, lowered back (S4).
+**Weight added, parked.** Two adults into the rear seats: a disturbance, then quiet. Once every corner has held still for 10 s it is LOAD, and the rear axle fills back to its target, about 10 s after the last movement plus 3-5 s of fill. 10 kg of groceries stays inside the deadband. When the passengers leave: UNLOAD, lowered back (S4).
+
+**Get in and drive, from the hill spot** (bench S18). The phone is not connected overnight; the in-car controller connects when the driver sits.
+1. Overnight on the crown, nothing moves; leaks and the arrival geometry are logged.
+2. With the car off, 20 kg go in the trunk and a rear passenger gets in. This is evaluated and vetoed (no BLE), and remembered.
+3. The driver sits, the controller connects, and you pull away 8 s later.
+
+Result:
+- 12 drive-away pulses in a 15-min town drive: the trunk load as decided parked, then the passenger and driver as DRIVE LOAD.
+- On flat ground it arrives at FP 49.7, RP 50.4, FD 49.6, RD 50.3 (preset 50) with nothing left to correct.
+- Back home on the crown, the twist (-9) is kept and the level plane is restored.
+- If nobody drives off, the first parked correction starts 11 s after the driver sat down, and fills toward the crown-shaped targets, not toward flat.
+- Before the arrival-target rule, the same trip ended at FP 61.9, RP 59.9, FD 54.3, RD 52.2: the stale crown targets were filled on flat ground.
 
 **Show preset (0 % / 0 psi).** It is user-held below min ride, so it is never lifted and never cruise-pulsed (S11b).
 
@@ -201,9 +233,10 @@ Order: shadow (collect data, [hcs-field-data.md](hcs-field-data.md)) -> set thre
 | R2b | let a corner leak below min ride, power-cycle the manifold, connect | BOTTOM_GUARD lifts it to the preset | not lifted |
 | R2c | >= 2 h drive with the leak | `CRUISE RD ... watching`, then pulses on RD only, only in steady driving | pulse on another corner or during a corner / brake |
 | R3 | two adults into the rear; 10 kg in the trunk | rear back to preset +-1.5 % within 60 s; the 10 kg does nothing | front actuated |
-| R4 | park on the hill spot overnight, connected | SHIFT on arrival; no correction that reduces the diagonal | any such correction |
+| R4 | park on the hill spot overnight (connect the phone for the test) | `ARRIVAL targets` with the twist, no correction at arrival; no correction that reduces the diagonal | any such correction |
 | R5 | 30 min mixed drive incl. dips, a hill bottom at speed, and the drive up into the hill spot | zero START / SHADOW START while moving | any |
 | R5b | load the trunk, drive off as soon as START logs | ABORT within 1 s | valve open > 1 s after moving |
+| R7 | at the hill spot: 2 people + trunk load, driver in last, drive off within 10 s; drive 15 min in town, park on flat ground | `DRIVE-AWAY` / `DRIVE LOAD` pulses only while going straight at steady speed; arrival within 3 % of the preset on every corner | a pulse during a turn / brake, or > 4 % off after arrival |
 | R6 | phone out of range, load the trunk | `VETO (no BLE client)`, nothing moves; reconnect -> corrected | anything moves without a client |
 | F1 | unplug a height sensor | FAULT within 1 s, corner never actuated | actuated |
 | F2 | jack one corner | EXTERNAL, nothing moves | anything moves |
@@ -219,6 +252,8 @@ Order: shadow (collect data, [hcs-field-data.md](hcs-field-data.md)) -> set thre
 | motion thresholds | **low until measured** | shadow STATS |
 | load threshold 1.5 %, pressure noise 1.5 psi | medium | shadow EVAL lines on door events |
 | cruise leak signature | medium | pulses on a healthy corner, or none while a corner sinks |
+| drive-load check (total pressure up + level plane low on drive averages) | medium | `DRIVE LOAD` on a drive with nobody added (aero, long climbs, temperature), or pulses that overshoot on arrival |
+| crown handled as twist | medium-high | arrival on the hill spot logs LOAD / AIR_LOSS with nobody added, or corrections that change the twist |
 | a car creeping at walking pace on glass-smooth floor is detected | **low** | bounded instead: confirmation, one axle, 10 s |
 
 ## 12. Legacy findings (tesla @ `6f7d6b78`), for reference
