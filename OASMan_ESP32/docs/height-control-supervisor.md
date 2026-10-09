@@ -4,7 +4,7 @@ Automatic ride-height holding for **height-sensor mode**. It holds the preset, r
 
 The only inputs are four heights, four bag pressures, tank pressure, valve / compressor state and "is a BLE client connected". There is no speed, door or IMU signal; everything else is inferred.
 
-Status: **compiles (all envs), 47/47 bench checks pass (17 scenarios, [hcs-simulator.md](hcs-simulator.md)), NOT yet run on a car.** Thresholds marked ESTIMATE in `hcs_config.h` must be measured first ([hcs-field-data.md](hcs-field-data.md)).
+Status: **compiles (all envs), 48/48 bench checks pass (17 scenarios, [hcs-simulator.md](hcs-simulator.md)), NOT yet run on a car.** Thresholds marked ESTIMATE in `hcs_config.h` must be measured first ([hcs-field-data.md](hcs-field-data.md)).
 
 ## 1. Where it sits
 
@@ -37,7 +37,7 @@ The core has no Arduino includes; `eval/hcs_sim.cpp` compiles the same files on 
 | INIT | first 10 s after boot | no |
 | INACTIVE | not height mode, maintain off, or safety mode | no |
 | MOTION | a motion episode (driving or a disturbance) | only the fill pulses of section 5 |
-| SETTLING | quiet, not long enough yet: 120 s after a drive or boot, 8 s after a disturbance | no |
+| SETTLING | quiet, not long enough yet: 120 s after a drive or boot, 3 s after a disturbance | no |
 | PARKED | evaluated; re-evaluates every 30 s, on events, and when a confirmation is due | may start a correction |
 | CORRECTING | one correction in flight, then 6 s settle and a result check | its own |
 | MANUAL | the user is doing something | no; yields, then re-baselines what the user touched |
@@ -72,14 +72,14 @@ Rules around it:
 - **Lift at connect.** When the BLE client connects, a corner the last parked evaluation found below min ride (overnight leak) is lifted at once, without waiting for people to settle; only confirmed driving stops it. Parked evaluations keep running without a client, so that finding is at most 30 s old.
 - **Arrival targets.** After a drive the old targets belong to the old spot. New targets = the **preset's level plane** + **this spot's twist** (FP + RD - FD - RP). Uneven ground is pure twist on a rigid car, so it is held, never corrected and never carried to the next spot. Corners within the deadband are held where they arrived, with fresh air references. Load is not compared across spots (a hanging wheel carries almost nothing); load added before leaving is caught on the road (section 5).
 - **Road level (ROAD).** The road is level on average, so a corner that sat off the preset level for the last drive window (twist removed) is off for an air reason: a leak the spot hides, air added at the spot, load. On arrival it is corrected by that much, and kept pending until within the deadband. Fills use the full deficit. Dumps use only the tilt part (heat lifts all four together and goes away), unless we added air since the last arrival (a min-ride lift, drive pulses).
-- **Confirmation.** A correction starts only after every corner held within 1.5 % for 10 s with no motion. A dip or the bottom of a hill at speed moves the car for seconds; a person or cargo stays. (Bench: disabled, a long highway sag on a glassy road triggers fills; enabled, none.)
+- **Confirmation.** A correction starts only after every corner held within 1.5 % with no motion for 10 s, or for 3 s right after a detected disturbance. People and cargo rock the car as they get in (a disturbance), so they are corrected within seconds. A smooth dip or sag at speed causes no disturbance and moves the car for several seconds, so the 10 s stands between it and a fill. (Bench: without it, a long highway sag on a glassy road triggers fills.)
 - **Event latch.** While a correction is pending, the load references stay frozen, so fixing the first loaded corner cannot erase the evidence for the second.
 
 ## 5. Driving: road level and fill pulses
 
 The parked path never acts while moving. This path is open-loop, fill-only, one corner at a time, pulses of at most 1.5 s:
 
-- **Every 2 min** of driving, each corner's average height, twist removed, is compared with the preset plane. Curves and braking tilt the car but cannot lower it on average (total load is constant). So only when the car sits **low overall** (mean deficit > 1 %) are corners low by more than 1.5 % (half the deadband) owed their deficit. That covers load added just before leaving, a lift cut short by driving off, and a leak on a long trip. (Bench: a 3-minute spiral ramp reads +7.8 % "low" on the outside corners and is correctly ignored.)
+- **Every 2 min** of driving, each corner's average height, twist removed, is compared with the preset plane. Curves and braking tilt the car but cannot lower it on average (total load is constant). So only when the car sits **low overall** (mean deficit > 1 %) are the corners carrying it owed their deficit: those with at least half the worst corner's deficit, and more than 1 %. (A leaking bag's neighbours show about a third of its deficit once the twist is removed; refilling the bag restores them.) That covers load added just before leaving, a lift cut short by driving off, and a leak on a long trip. (Bench: a 3-minute spiral ramp reads +7.8 % "low" on the outside corners and is correctly ignored.)
 - **Pulses** go only when every corner's 1-s average has held within 2 % for 8 s (pulling out, braking and turning in all break that). A pulse is cut the moment roll or pitch starts to change (bench: within 0.1-0.2 s). At most 2 % per pulse, never more than owed, at most 10 % per corner per window.
 - **Self-calibrating.** Pulse length comes from the corner's fill rate. The next window measures what the pulses really did and updates that rate (as parked fills do). Until a rate is known, a window owes only half its deficit, so a wrong default cannot overshoot.
 - Each window's top-up counts as a refill for the fast-leak latch, so a burst bag latches while driving too.
@@ -109,8 +109,8 @@ One correction at a time: the axle with the largest error, one direction. Motion
 - **Driving (S2).** Sweepers, braking, a spiral ramp, highway, red lights: zero corrections and zero pulses.
 - **Dips / hill bottoms at speed (S16).** Normal and glassy roads, long highway sags: zero fills, dumps or pulses. Load after parking is still corrected.
 - **Leak below min ride, no BLE, reboot at 5 h (S3).** Nothing moves while you are away; at connect RD 34.4 -> 48.4.
-- **Two rear passengers (S4).** Rear 45.0 -> 49.8 about 10 s after the last movement; groceries ignored; lowered back when they leave.
-- **Get in and drive from the hill spot (S18).** No BLE overnight, trunk + passenger loaded with the car off, the driver sits, you leave 8 s later. 12 pulses in a 15-min town drive; flat-ground arrival 50.2 / 49.6 / 47.3 / 46.7; home again, the crown's twist (-9) is kept and the plane restored (worst 2.4). If nobody drives, the first correction starts 11 s after the driver sat.
+- **Two rear passengers (S4).** Rear 45.0; the correction starts 4.7 s after the last movement and the rear is back inside the deadband at 5.5 s (fill speed is the car's); groceries ignored; lowered back when they leave.
+- **Get in and drive from the hill spot (S18).** No BLE overnight, trunk + passenger loaded with the car off, the driver sits, you leave 8 s later. The parked correction starts 4 s after the driver sits and is cut when you pull away; the rest comes as 12 pulses in a 15-min town drive. Flat-ground arrival 52.7 / 50.5 / 49.1 / 46.9; home again, the crown's twist (-9) is kept and the plane restored (worst 2.5).
 - **Long trip, RD leaking 2.5 %/h (S15).** 2 pulses, RD only, none left open after a curve began; RD within 3.2 % of the others.
 - **Your spot (S19)**, modelled with your numbers (65 psi at the preset, tank 145 / 180, min ride 20): FP 34, RP 87, FD 100, RD 23.5, bags 89 / 40 / 35 / 116 psi. The hanging wheel looks like a jack (EXTERNAL): only min-ride lifts may act. Nothing is below min ride, so nothing moves. Overnight RD leaks to 14 % (it would drag); when the controller connects the lift starts at once, and 12 s later RD is at 19.4 and rising (bag ~134 psi with the people in, tank down to 143 and refilling). Driving clears the freeze; flat-ground arrival 51.4 / 49.7 / 48.7 / 47.0. Separately: a spot that presses corners below min ride gets them lifted on the spot, and a tank that can never get 20 psi above the bag is refused with the reason logged.
 - **Show preset 0 % / 0 psi (S11b).** User-held below min ride: never lifted, never pulsed.
@@ -153,7 +153,7 @@ Order: shadow (collect data) -> set thresholds -> diag with you watching -> hcs.
 | R2 | RD's slow leak | AIR_LOSS refills to target; neighbours log COUPLED, not SHIFT | another corner actuated |
 | R2b | RD below min ride, power-cycle the manifold, connect | lifted to the preset | not lifted |
 | R2e | morning with RD below min ride, get in normally | `URGENT ... lifting now` within a second of connecting | lift waits for people, or RD still low with no logged reason |
-| R3 | two adults into the rear; 10 kg in the trunk | rear back within 3 % within 60 s; the 10 kg does nothing | front actuated |
+| R3 | two adults into the rear; 10 kg in the trunk | rear starts rising within ~5 s of them sitting still, back within 3 %; the 10 kg does nothing | front actuated, or nothing within 10 s |
 | R4 | hill spot overnight (phone connected for the test) | `ARRIVAL targets` with the twist; no correction that changes the twist | any |
 | R5 | 30 min mixed drive incl. dips, a hill bottom at speed, a parking ramp | zero START / SHADOW START while moving; no `-> sits low` without load or a leak | any |
 | R5b | load the trunk, drive off as START logs | ABORT within 1 s | valve open > 1 s after moving |

@@ -16,14 +16,15 @@ HCS_DUMP_FROM=790000 HCS_DUMP_TO=800000 ./hcs_sim S1   # HCSD state lines betwee
 
 Every value in `hcs_config.h` can be overridden with `-D`, e.g. `-DHCS_MOTION_H_THRESH=1.0f`.
 
-**What a check is for.** 47 checks over 17 scenarios. Each asserts one behaviour no other check covers, or a precondition that stops a scenario from passing vacuously. Each guarded rule was disabled with a `-D` override to confirm a check fails:
+**What a check is for.** 48 checks over 17 scenarios. Each asserts one behaviour no other check covers, or a precondition that stops a scenario from passing vacuously. Each guarded rule was disabled with a `-D` override to confirm a check fails:
 
 | Override | Fails |
 |---|---|
 | `-DHCS_CONFIRM_MS=0` (no confirmation) | S16 dips |
+| `-DHCS_CONFIRM_LOAD_MS=10000` (no fast confirmation after people / cargo) | S4 |
 | `-DHCS_URGENT_MAX_AGE_MS=0` (no lift at connect) | S19 |
 | `-DHCS_OWE_MAX=0.0f` (no drive pulses) | S15, S18, S19 |
-| `-DHCS_ROAD_HEAVE_MIN=-100.0f` (no "sits low overall" gate) | S2 spiral ramp, S15 |
+| `-DHCS_ROAD_HEAVE_MIN=-100.0f` (no "sits low overall" gate) | S2 spiral ramp, S15, S16 |
 | `-DHCS_AUTO_LOWER=false` | S4 unload, S15, S19 |
 
 ## The simulated car
@@ -48,7 +49,7 @@ Not modelled: bag hysteresis, tyre compliance, fast (adiabatic) compression, rea
 | S1 | hill spot: crown + slope, connected 8 h, cooling, slow leak on a hanging corner | targets = preset plane + crown twist; hanging corners never dumped; compressed corners never pushed flat; leak refilled; no false latch |
 | S2 | 30 min mixed driving (sweepers, braking, a 3-min spiral ramp, highway, red lights); a blind-detector variant | zero corrections and pulses while moving |
 | S3 | overnight leak below min ride, no BLE, reboot at 5 h, owner returns at 8 h; a "nothing persisted" variant | nothing moves without BLE; RD lifted into the deadband; only RD actuated |
-| S4 | two rear passengers, 10 kg groceries, passengers leave | rear lifted back; front untouched; groceries ignored; lowered back |
+| S4 | two rear passengers, 10 kg groceries, passengers leave | correction starts within 5 s of the last movement; rear lifted back; front untouched; groceries ignored; lowered back |
 | S5 | drive off in the middle of a correction | aborted within 1.5 s, valves closed |
 | S6 | load with no BLE client, then it connects | vetoed while absent; corrected after |
 | S7 | RD wire break, then a second sensor | corner frozen; FAULT with two |

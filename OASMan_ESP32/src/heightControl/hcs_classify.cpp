@@ -328,11 +328,13 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
         if (reref[i] && (!eventOpen || forceReref) && !externalFreeze)
             c[i].pRef = pm[i];
 
-    // ---- 7. confirmation: every corner steady for HCS_CONFIRM_MS with no motion (a dip / hill bottom moves the car)
-    const uint32_t left = pending ? steadyRemaining() : 0;
+    // ---- 7. confirmation: every corner steady with no motion for HCS_CONFIRM_MS (a dip / sag at speed moves the car),
+    //         or HCS_CONFIRM_LOAD_MS right after a detected disturbance (people / cargo)
+    const uint32_t confirmMs = (afterDisturb && (now - lastMotion) < 30000UL) ? HCS_CONFIRM_LOAD_MS : HCS_CONFIRM_MS;
+    const uint32_t left = pending ? steadyRemaining(confirmMs) : 0;
     if (left != 0)
     {
-        const uint32_t wait = left == 0xFFFFFFFFUL ? (uint32_t)HCS_CONFIRM_MS : left;
+        const uint32_t wait = left == 0xFFFFFFFFUL ? confirmMs : left;
         for (int i = 0; i < NC; i++)
             if (dir[i] != 0)
             {

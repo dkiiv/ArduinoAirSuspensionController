@@ -223,6 +223,7 @@ void Core::motionDetect()
         if (!driving && (now - episodeStart) >= HCS_DRIVE_CONFIRM_MS)
         {
             driving = armedAfterDrive = true;
+            afterDisturb = false;
             logf("DRIVING confirmed (motion for %lus) -> parked corrections vetoed; re-baseline on arrival",
                  (unsigned long)((now - episodeStart) / 1000));
             roadDefValid = false; // a new drive decides afresh
@@ -241,14 +242,15 @@ void Core::motionDetect()
         inEpisode = false;
         logf("MOTION end ep=%lu after %lus (%s)", (unsigned long)episodeId, (unsigned long)((lastMotion - episodeStart) / 1000),
              driving ? "drive" : "disturbance");
+        afterDisturb = !driving;
         driving = false;
         needEval = true;
     }
 }
 
-// Has every healthy corner held inside HCS_STABLE_RANGE_H, with no movement / own valve activity, for HCS_CONFIRM_MS
+// Has every healthy corner held inside HCS_STABLE_RANGE_H, with no movement / own valve activity, for confirmMs
 // (a window that ended steady carries over)? Returns the ms still needed, 0 when it has, 0xFFFFFFFF if it moved.
-uint32_t Core::steadyRemaining() const
+uint32_t Core::steadyRemaining(uint32_t confirmMs) const
 {
     uint32_t need = 0;
     for (int i = 0; i < NC; i++)
@@ -259,8 +261,8 @@ uint32_t Core::steadyRemaining() const
         if (!k.qOk || (k.qHi - k.qLo) > HCS_STABLE_RANGE_H)
             return 0xFFFFFFFFUL;
         const uint32_t age = now - k.qStart;
-        if (!k.qPrev && age < HCS_CONFIRM_MS && HCS_CONFIRM_MS - age > need)
-            need = HCS_CONFIRM_MS - age;
+        if (!k.qPrev && age < confirmMs && confirmMs - age > need)
+            need = confirmMs - age;
     }
     return need;
 }

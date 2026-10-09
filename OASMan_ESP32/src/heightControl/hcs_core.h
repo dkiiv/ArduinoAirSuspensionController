@@ -184,7 +184,7 @@ private:
     float tank;
     bool tankValid;
     // motion
-    bool inEpisode, driving, armedAfterDrive, bootPending;
+    bool inEpisode, driving, armedAfterDrive, bootPending, afterDisturb; // afterDisturb: the last episode was a disturbance
     uint32_t episodeStart, lastMotion, episodeId;
     int lastIncluded, lastVoting, lastStrong, motionRun, abortRun;
     // evaluation
@@ -229,7 +229,7 @@ private:
     void detectFaults(const Inputs &in, int i);
     void motionDetect();
     bool windowMean(int i, float &hm, float &pm, bool &pOk, bool &stable) const;
-    uint32_t steadyRemaining() const; // 0 = steady HCS_CONFIRM_MS; 0xFFFFFFFF = moved too much
+    uint32_t steadyRemaining(uint32_t need) const; // 0 = steady that long; 0xFFFFFFFF = moved too much
     bool pUsable(int i) const { return !c[i].pFault && c[i].ndp >= 3; }
     // hcs_classify.cpp
     void evaluate(const Inputs &in, Outputs &out, const char *kind, bool arrival);

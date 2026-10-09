@@ -6,8 +6,8 @@
 //
 // The road is level on average, so a 2-minute average of each corner, twist removed, says where the car really sits.
 // Cornering, braking, hills and dips tilt or bounce it, but cannot LOWER it on average: the total load is constant.
-// So the window must show the car low overall (mean deficit > HCS_ROAD_HEAVE_MIN) before any corner low by more than
-// half the deadband is topped up -- by at most what that window says it is missing.
+// So the window must show the car low overall (mean deficit > HCS_ROAD_HEAVE_MIN) before the corners carrying that
+// deficit are topped up -- by at most what that window says each is missing.
 
 #include "hcs_core.h"
 
@@ -156,7 +156,7 @@ void Core::driveTick(const Inputs &in, Outputs &out)
 }
 
 // One road window: where the car sat on average versus the preset plane (kept for the arrival evaluation, ROAD). If it
-// sat low overall, the corners low by more than half the deadband are owed their deficit.
+// sat low overall, the corners carrying it are owed their deficit.
 void Core::roadWindow()
 {
     float hmean[NC], ref[NC], d[NC];
@@ -192,11 +192,16 @@ void Core::roadWindow()
     const bool low = heave > HCS_ROAD_HEAVE_MIN && !externalFreeze;
     logq("ROAD level vs preset (+ = low): FP %+.1f RP %+.1f FD %+.1f RD %+.1f, mean %+.1f%s", d[C_FP], d[C_RP], d[C_FD], d[C_RD], heave,
          low ? " -> sits low: top up" : "");
+    // the corners carrying it: at least half the worst deficit (a leaking bag's neighbours show ~1/3 of its deficit
+    // after the twist is removed -- refilling the leaking bag restores them), and more than HCS_ROAD_HEAVE_MIN
+    float worst = 0;
+    for (int i = 0; i < NC; i++)
+        worst = fmaxf_(worst, d[i]);
     for (int i = 0; low && i < NC; i++)
     {
         Corner &k = c[i];
-        if (d[i] <= 0.5f * HCS_DEADBAND_H || k.floorOverride >= 0 || k.hFault)
-            continue; // fill-only pulses cannot hunt: top up to within half the deadband
+        if (d[i] <= fmaxf_(HCS_ROAD_HEAVE_MIN, 0.5f * worst) || k.floorOverride >= 0 || k.hFault)
+            continue;
         k.owe = fminf_(finite_(k.fillRate) ? d[i] : 0.5f * d[i], HCS_OWE_MAX); // rate unknown: half, re-measured next window
         if (!shadow)
             recordRefill(i, k.owe); // a burst bag latches like a parked one

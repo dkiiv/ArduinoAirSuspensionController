@@ -58,7 +58,7 @@
 #define HCS_ARRIVAL_QUIET_MS 120000 // quiet after a drive / boot before evaluating (rides out red lights)
 #endif
 #ifndef HCS_DISTURB_QUIET_MS
-#define HCS_DISTURB_QUIET_MS 8000
+#define HCS_DISTURB_QUIET_MS 3000 // quiet after a door / person / trunk disturbance
 #endif
 #ifndef HCS_EVAL_PERIOD_MS
 #define HCS_EVAL_PERIOD_MS 30000
@@ -81,6 +81,11 @@
 // or the bottom of a hill compresses (and moves) the car for seconds; a person or cargo stays.
 #ifndef HCS_CONFIRM_MS
 #define HCS_CONFIRM_MS 10000
+#endif
+// Right after a detected disturbance (people / cargo rock the car; a smooth sag at speed does not) the confirmation is
+// this short, so added weight is corrected within seconds.
+#ifndef HCS_CONFIRM_LOAD_MS
+#define HCS_CONFIRM_LOAD_MS 3000
 #endif
 
 // ---- classifier
@@ -186,7 +191,7 @@
 
 // ---- driving: road level. The road is level on average; curves and braking only tilt the car, they cannot lower it
 // on average (the total load is constant). A window in which the car sits LOW overall (mean deficit versus the preset
-// > HCS_ROAD_HEAVE_MIN: load added before leaving, a leak) tops up the corners low by more than half the deadband.
+// > HCS_ROAD_HEAVE_MIN: load added before leaving, a leak) tops up the corners carrying that deficit.
 #ifndef HCS_ROAD_WINDOW_MS
 #define HCS_ROAD_WINDOW_MS 120000UL
 #endif

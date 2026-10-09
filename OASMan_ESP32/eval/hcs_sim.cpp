@@ -606,10 +606,22 @@ static void scenarioLoad()
     s.extraF[C_RD] += 0.09f;
     s.extraF[C_FP] -= 0.01f;
     s.extraF[C_FD] -= 0.01f;
-    s.run(5);
-    printf("  loaded: RP=%.1f RD=%.1f\n", s.h[C_RP], s.h[C_RD]);
-    s.run(90);
-    printf("  90 s later: RP=%.1f RD=%.1f starts=%d\n", s.h[C_RP], s.h[C_RD], s.starts);
+    const uint32_t tq = s.t; // the people stop moving
+    const int sq = s.starts;
+    uint32_t tStart = 0, tBack = 0;
+    float loadedRP = 0, loadedRD = 0;
+    s.run(95, [&](Sim &x) {
+        if (x.t - tq == 2000)
+            loadedRP = x.h[C_RP], loadedRD = x.h[C_RD];
+        if (!tStart && x.starts > sq)
+            tStart = x.t;
+        if (tStart && !tBack && fabsf(x.h[C_RP] - 50) <= HCS_DEADBAND_H && fabsf(x.h[C_RD] - 50) <= HCS_DEADBAND_H)
+            tBack = x.t;
+    });
+    printf("  loaded: RP=%.1f RD=%.1f; correction starts %.1f s after the last movement, rear inside the deadband after %.1f s;"
+           " 95 s later RP=%.1f RD=%.1f\n",
+           loadedRP, loadedRD, (tStart - tq) / 1000.0f, (tBack - tq) / 1000.0f, s.h[C_RP], s.h[C_RD]);
+    check(tStart && tStart - tq <= 5000, "S4", "people / cargo: the correction starts within 5 s of the last movement");
     check(fabsf(s.h[C_RP] - 50) <= 1.5f && fabsf(s.h[C_RD] - 50) <= 1.5f, "S4", "rear lifted back to preset");
     check(s.fillsOn[C_FP] == 0 && s.fillsOn[C_FD] == 0, "S4", "front not touched");
     int st0 = s.starts;

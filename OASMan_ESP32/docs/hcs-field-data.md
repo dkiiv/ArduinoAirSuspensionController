@@ -54,6 +54,7 @@ All happen in normal use once the logger runs; only 3 needs doing on purpose.
 | `HCS_CALM_H` | `HCSD` h while driving straight | the 1-s wobble on straight roads plus margin |
 | `HCS_FILL_RATE_DEFAULT` | `RESULT ... IN open` | measured %/s (learned per corner anyway, and persisted) |
 | `HCS_ARRIVAL_QUIET_MS`, `HCS_CONFIRM_MS` | drive logs: longest stop-and-go stop, longest compression | longer than both |
+| `HCS_CONFIRM_LOAD_MS`, `HCS_DISTURB_QUIET_MS` | known-load session: how long the car keeps settling after people sit | just longer than that |
 
 ## 4. Facts about the car
 
