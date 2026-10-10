@@ -89,6 +89,7 @@ struct Sim
     bool shadow = false; // boot the supervisor in shadow mode (decide + log, never actuate)
     bool enabled = true;
     float rough = 0;  // road roughness (0 = parked)
+    float readBias = 0; // height reading offset while moving (packing / linkage nonlinearity on rough roads)
     bool moving = false;
     float bounceT = 0;
     float rawFault[4] = {NAN, NAN, NAN, NAN}; // forced raw height (wire break)
@@ -291,7 +292,7 @@ struct Sim
                 road = rough * (0.8f * N(rng) + 0.9f * sinf(2 * 3.14159f * 1.4f * bounceT + i));
                 proad = rough * 2.5f * N(rng);
             }
-            float hm = h[i] + 0.15f * N(rng) + road;
+            float hm = h[i] + 0.15f * N(rng) + road + (moving ? readBias : 0.0f);
             float hmc = hm < 0 ? 0 : (hm > 100 ? 100 : hm);
             float pm = p[i] + 0.25f * N(rng) + proad;
             bool vo = manualIn[i] || r[i].active || pulseUntil[i] != 0;
@@ -555,6 +556,46 @@ static void scenarioDriving()
     b.moving = false;
     check(b.starts == 0, "S2", fmt("blind-detector cornering classified as SHIFT, never actuated (starts=%d, SHIFT lines=%d)", b.starts,
                                     countLog("SHIFT")));
+
+    // a long rough, hilly highway stretch where the AVERAGE reading sits 6 % low (rebound damping packs the car down,
+    // linkage / spring nonlinearity), then smooth highway: no air may be added for it
+    Sim r;
+    g_log.clear();
+    parkedAtPreset(r);
+    float tt = 0;
+    r.moving = true;
+    r.run(1200, [&](Sim &x) { // 20 min: 90 s rough + swells (reads low), 30 s smooth, repeated
+        tt += 0.1f;
+        const bool rough = fmodf(tt, 120.0f) < 90.0f;
+        x.rough = rough ? 1.6f : 0.35f;
+        x.readBias = rough ? -6.0f : 0.0f;
+        x.heave = rough ? 0.12f * sinf(2 * 3.14159f * 0.2f * tt) : 0.0f;
+    });
+    r.heave = 0;
+    r.readBias = 0;
+    r.drive(600, 0.35f, true, 150.0f); // 10 min smooth highway
+    r.roll = r.pitch = 0;
+    r.solve();
+    float hiR = 0;
+    for (int i = 0; i < 4; i++)
+        hiR = fmaxf(hiR, r.h[i] - 50);
+    printf("  20 min rough + hilly stretches (read 6 %% low) with calm gaps, then smooth: pulses %d, highest corner %+.1f vs preset\n", r.pulses, hiR);
+    check(r.pulses == 0 && hiR <= HCS_DEADBAND_H, "S2", "a rough road that only reads low adds no air");
+
+    // a bias the gates cannot see (reads 15 % low on a calm road for 40 min): the per-drive cap bounds it
+    Sim q;
+    g_log.clear();
+    parkedAtPreset(q);
+    q.readBias = -15.0f;
+    q.drive(2400, 0.35f, true, 150.0f);
+    q.readBias = 0;
+    q.roll = q.pitch = 0;
+    q.solve();
+    float hiQ = 0;
+    for (int i = 0; i < 4; i++)
+        hiQ = fmaxf(hiQ, q.h[i] - 50);
+    printf("  40 min calm road reading 15 %% low: pulses %d, highest corner %+.1f vs preset\n", q.pulses, hiQ);
+    check(hiQ <= 12.0f, "S2", "whatever the reading, a drive adds about 10 % per corner at most (cap + open-loop pulse error)");
 }
 
 // Suspected bug: leak below min ride overnight with no BLE, reboot in between, owner returns

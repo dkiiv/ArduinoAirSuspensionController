@@ -228,8 +228,9 @@ void Core::motionDetect()
                  (unsigned long)((now - episodeStart) / 1000));
             roadDefValid = false; // a new drive decides afresh
             sdN = 0;
+            sdAct = 0;
             for (int i = 0; i < NC; i++)
-                c[i].roadPending = false, c[i].sdH = c[i].owe = 0, c[i].pulsedMs = 0;
+                c[i].roadPending = false, c[i].sdH = c[i].owe = c[i].driveAdded = 0, c[i].pulsedMs = 0;
             if (externalFreeze)
             {
                 externalFreeze = false; // a car on a jack is not driving (the unloaded wheel was uneven ground)

@@ -4,7 +4,7 @@ Automatic ride-height holding for **height-sensor mode**. It holds the preset, r
 
 The only inputs are four heights, four bag pressures, tank pressure, valve / compressor state and "is a BLE client connected". There is no speed, door or IMU signal; everything else is inferred.
 
-Status: **compiles (all envs), 49/49 bench checks pass (17 scenarios, [hcs-simulator.md](hcs-simulator.md)), NOT yet run on a car.** Thresholds marked ESTIMATE in `hcs_config.h` must be measured first ([hcs-field-data.md](hcs-field-data.md)).
+Status: **compiles (all envs), 51/51 bench checks pass (17 scenarios, [hcs-simulator.md](hcs-simulator.md)), NOT yet run on a car.** Thresholds marked ESTIMATE in `hcs_config.h` must be measured first ([hcs-field-data.md](hcs-field-data.md)).
 
 ## 1. Where it sits
 
@@ -80,7 +80,8 @@ Rules around it:
 The parked path never acts while moving. This path is open-loop, fill-only, one corner at a time, pulses of at most 1.5 s:
 
 - **Every 2 min** of driving, each corner's average height, twist removed, is compared with the preset plane. Curves and braking tilt the car but cannot lower it on average (total load is constant). So only when the car sits **low overall** (mean deficit > 1 %) are the corners carrying it owed their deficit: those with at least half the worst corner's deficit, and more than 1 %. (A leaking bag's neighbours show about a third of its deficit once the twist is removed; refilling the bag restores them.) That covers load added just before leaving, a lift cut short by driving off, and a leak on a long trip. (Bench: a 3-minute spiral ramp reads +7.8 % "low" on the outside corners and is correctly ignored.)
-- **Pulses** go only when every corner's 1-s average has held within 2 % for 8 s (pulling out, braking and turning in all break that). A pulse is cut the moment roll or pitch starts to change (bench: within 0.1-0.2 s). At most 2 % per pulse, never more than owed, at most 10 % per corner per window.
+- **Rough roads.** On a rough road the average reading is not where the car sits: rebound damping packs it down, and spring / linkage nonlinearity shifts the mean. A window whose mean height activity is above 2.5x the motion threshold (ESTIMATE) is ignored. Each window's verdict replaces the last, so nothing owed earlier is delivered after a rough stretch. And a drive adds at most 10 % per corner, whatever the readings say. (Bench: the build before this change added air on a rough stretch that read 6 % low, and raised the car +17 % on a calm road reading 15 % low; now 0 and about +11.)
+- **Pulses** go only when every corner's 1-s average has held within 2 % for 8 s (pulling out, braking and turning in all break that). A pulse is cut the moment roll or pitch starts to change (bench: within 0.1-0.2 s). At most 2 % per pulse, never more than owed.
 - **Self-calibrating.** Pulse length comes from the corner's fill rate. The next window measures what the pulses really did and updates that rate (as parked fills do). Until a rate is known, a window owes only half its deficit, so a wrong default cannot overshoot.
 - Each window's top-up counts as a refill for the fast-leak latch, so a burst bag latches while driving too.
 
@@ -173,6 +174,7 @@ Order: shadow (collect data) -> set thresholds -> diag with you watching -> hcs.
 | motion thresholds | **low until measured** | shadow `HCSD` aH / aP parked vs driving |
 | load threshold 1.5 %, pressure noise 1.5 psi | medium | shadow EVAL lines on known loads |
 | "sits low overall" means air or load | medium | `-> sits low` on drives where nothing changed (aero lift at speed, a commute that is one long climb) |
+| rough-road windows are recognised (2.5x) | **low until measured** | `ROAD ... rough x` values on known rough / smooth roads; the car rising on rough roads |
 | crown handled as twist | medium-high | arrival on the hill spot logs LOAD / AIR_LOSS with nobody added |
 | the severe spot freezes as EXTERNAL | medium | the real hanging wheel keeps > 65 % of its pressure (then normal rules apply; min-ride lifts either way) |
 | a car creeping at walking pace on a glassy floor is detected | **low** | bounded instead: confirmation, one axle, 10 s |

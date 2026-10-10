@@ -195,11 +195,14 @@
 #ifndef HCS_ROAD_WINDOW_MS
 #define HCS_ROAD_WINDOW_MS 120000UL
 #endif
+#ifndef HCS_ROAD_ROUGH_MAX
+#define HCS_ROAD_ROUGH_MAX 2.5f // window ignored above this mean height activity (x motion threshold): rough roads bias
+#endif                          // the average reading. ESTIMATE (bench: highway ~1, busy town ~2.2, rough ~3)
 #ifndef HCS_ROAD_HEAVE_MIN
 #define HCS_ROAD_HEAVE_MIN 1.0f // height %, ESTIMATE
 #endif
 #ifndef HCS_OWE_MAX
-#define HCS_OWE_MAX 10.0f // most ever delivered per corner per window
+#define HCS_OWE_MAX 10.0f // most ever added per corner per drive (hard cap, whatever the readings say)
 #endif
 #ifndef HCS_PULSE_STEP
 #define HCS_PULSE_STEP 2.0f // height % per pulse

@@ -27,7 +27,7 @@ static bool tilted(const float *d, float lim)
 
 void Core::driveTick(const Inputs &in, Outputs &out)
 {
-    // ---- 1-s averages (calm, pulse gates) and the road window sums (only when no corner is moving air)
+    // ---- 1-s averages (calm, pulse gates); a corner moving air makes the road window skip this sample
     bool quiet = true;
     for (int i = 0; i < NC; i++)
     {
@@ -44,12 +44,6 @@ void Core::driveTick(const Inputs &in, Outputs &out)
             k.hS = h, k.pS = p, k.calmLo = k.calmHi = h, k.hsOk = true;
         k.hS += 0.1f * (h - k.hS);
         k.pS += 0.1f * (p - k.pS);
-    }
-    if (driving && quiet)
-    {
-        for (int i = 0; i < NC; i++)
-            c[i].sdH += in.c[i].h;
-        sdN++;
     }
     // calm: every corner's 1-s average inside HCS_CALM_H since calmSince (turning in / out, braking, bumps move it; a
     // long steady curve does not -- a pulse there adds nearly the same air)
@@ -74,6 +68,16 @@ void Core::driveTick(const Inputs &in, Outputs &out)
         for (int i = 0; i < NC; i++)
             c[i].calmLo = c[i].calmHi = c[i].hS;
     }
+    if (driving && quiet)
+    {
+        for (int i = 0; i < NC; i++)
+            c[i].sdH += in.c[i].h;
+        sdN++;
+        float act = 0; // how hard the suspension works (bumps), in multiples of the motion threshold
+        for (int i = 0; i < NC; i++)
+            act += 0.25f * c[i].actH / HCS_MOTION_H_THRESH;
+        sdAct += act;
+    }
 
     // ---- a pulse in flight: end it on time, or the moment anything is not right
     if (pulseCorner >= 0)
@@ -97,6 +101,7 @@ void Core::driveTick(const Inputs &in, Outputs &out)
             }
             pulseCorner = -1;
             sdN = 0; // the car changed on purpose: restart the road window
+            sdAct = 0;
             for (int i = 0; i < NC; i++)
                 c[i].sdH = 0;
             roadDefValid = false;
@@ -156,7 +161,8 @@ void Core::driveTick(const Inputs &in, Outputs &out)
 }
 
 // One road window: where the car sat on average versus the preset plane (kept for the arrival evaluation, ROAD). If it
-// sat low overall, the corners carrying it are owed their deficit.
+// sat low overall, the corners carrying it are owed their deficit. Rough windows are ignored; each window's verdict
+// replaces the last; a drive adds at most HCS_OWE_MAX per corner.
 void Core::roadWindow()
 {
     float hmean[NC], ref[NC], d[NC];
@@ -166,7 +172,18 @@ void Core::roadWindow()
         ref[i] = presetValid ? (float)presetH[i] : c[i].tgt;
         c[i].sdH = 0;
     }
+    const float rough = sdAct / sdN;
     sdN = 0;
+    sdAct = 0;
+    if (rough > HCS_ROAD_ROUGH_MAX)
+    {
+        // on a rough road the average reading is not where the car sits (rebound damping packs it down, spring /
+        // linkage nonlinearity shifts the mean): this window says nothing, and nothing owed from before is delivered
+        for (int i = 0; i < NC; i++)
+            c[i].owe = 0;
+        logq("ROAD window rough (%.1f) -> ignored", rough);
+        return;
+    }
     roadDefValid = planeDeficit(hmean, d, ref);
     if (!roadDefValid)
         return;
@@ -190,19 +207,27 @@ void Core::roadWindow()
         heave += 0.25f * d[i];
     }
     const bool low = heave > HCS_ROAD_HEAVE_MIN && !externalFreeze;
-    logq("ROAD level vs preset (+ = low): FP %+.1f RP %+.1f FD %+.1f RD %+.1f, mean %+.1f%s", d[C_FP], d[C_RP], d[C_FD], d[C_RD], heave,
-         low ? " -> sits low: top up" : "");
+    logq("ROAD level vs preset (+ = low): FP %+.1f RP %+.1f FD %+.1f RD %+.1f, mean %+.1f, rough %.1f%s", d[C_FP], d[C_RP], d[C_FD],
+         d[C_RD], heave, rough, low ? " -> sits low: top up" : "");
     // the corners carrying it: at least half the worst deficit (a leaking bag's neighbours show ~1/3 of its deficit
     // after the twist is removed -- refilling the leaking bag restores them), and more than HCS_ROAD_HEAVE_MIN
     float worst = 0;
     for (int i = 0; i < NC; i++)
         worst = fmaxf_(worst, d[i]);
-    for (int i = 0; low && i < NC; i++)
+    for (int i = 0; i < NC; i++)
     {
         Corner &k = c[i];
-        if (d[i] <= fmaxf_(HCS_ROAD_HEAVE_MIN, 0.5f * worst) || k.floorOverride >= 0 || k.hFault)
+        k.owe = 0; // each window's verdict replaces the last (nothing stale is delivered later)
+        if (!low || d[i] <= fmaxf_(HCS_ROAD_HEAVE_MIN, 0.5f * worst) || k.floorOverride >= 0 || k.hFault)
             continue;
-        k.owe = fminf_(finite_(k.fillRate) ? d[i] : 0.5f * d[i], HCS_OWE_MAX); // rate unknown: half, re-measured next window
+        k.owe = fminf_(finite_(k.fillRate) ? d[i] : 0.5f * d[i], HCS_OWE_MAX - k.driveAdded); // rate unknown: half
+        if (k.owe < 0.5f)
+        {
+            k.owe = 0;
+            logq("ROAD %s: %.0f %% already added this drive (cap) -> no more", CN[i], (double)k.driveAdded);
+            continue;
+        }
+        k.driveAdded += k.owe; // hard cap per drive, whatever the readings say
         if (!shadow)
             recordRefill(i, k.owe); // a burst bag latches like a parked one
     }

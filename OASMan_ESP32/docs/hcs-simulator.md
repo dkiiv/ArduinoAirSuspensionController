@@ -16,15 +16,17 @@ HCS_DUMP_FROM=790000 HCS_DUMP_TO=800000 ./hcs_sim S1   # HCSD state lines betwee
 
 Every value in `hcs_config.h` can be overridden with `-D`, e.g. `-DHCS_MOTION_H_THRESH=1.0f`.
 
-**What a check is for.** 49 checks over 17 scenarios. Each asserts one behaviour no other check covers, or a precondition that stops a scenario from passing vacuously. Each guarded rule was disabled with a `-D` override to confirm a check fails:
+**What a check is for.** 51 checks over 17 scenarios. Each asserts one behaviour no other check covers, or a precondition that stops a scenario from passing vacuously. Each guarded rule was disabled with a `-D` override to confirm a check fails:
 
 | Override | Fails |
 |---|---|
 | `-DHCS_CONFIRM_MS=0` (no confirmation) | S16 dips |
 | `-DHCS_CONFIRM_LOAD_MS=10000` (no fast confirmation after people / cargo or below min ride) | S3 bleed, S4 |
 | `-DHCS_URGENT_MAX_AGE_MS=0` (no lift at connect) | S19 |
-| `-DHCS_OWE_MAX=0.0f` (no drive pulses) | S15, S18, S19 |
-| `-DHCS_ROAD_HEAVE_MIN=-100.0f` (no "sits low overall" gate) | S2 spiral ramp, S15, S16 |
+| `-DHCS_OWE_MAX=0.0f` (no drive pulses) | S15, S18 |
+| `-DHCS_ROAD_HEAVE_MIN=-100.0f` (no "sits low overall" gate) | S2 spiral ramp, S15 |
+| `-DHCS_ROAD_ROUGH_MAX=100.0f` (rough windows trusted) | S2 rough road |
+| `-DHCS_OWE_MAX=100.0f` (no per-drive cap) | S2 biased calm road |
 | `-DHCS_AUTO_LOWER=false` | S4 unload, S15, S19 |
 
 ## The simulated car
@@ -38,7 +40,7 @@ A **rigid body** (heave, pitch, roll) on four air springs, solved for static equ
 - **Air.** `leakPerHour[i]`; `T` for heating / cooling.
 - **Compressor.** On below `tankOn`, off at `tankOff` (default 140 / 180), **only with a BLE client**; +1 psi/s.
 - **Valves.** Flow proportional to tank - bag. The goal routine is emulated (stops at target, ceiling or floor; times out). Manual valves and fill pulses too. A fill with the tank below the bag never pushes air back here, as it could on a car.
-- **Measurement.** Noise 0.15 % height, 0.25 psi; `rough` adds road input (random + 1.4 Hz bounce); bag pressure reads high while its IN valve is open; `rawFault[i]` forces a raw reading (wire break).
+- **Measurement.** Noise 0.15 % height, 0.25 psi; `readBias` shifts the height reading while moving (rough-road packing / linkage nonlinearity); `rough` adds road input (random + 1.4 Hz bounce); bag pressure reads high while its IN valve is open; `rawFault[i]` forces a raw reading (wire break).
 
 Not modelled: bag hysteresis, tyre compliance, fast (adiabatic) compression, real valve flow curves, the AI flow-offset model, the BLE link. Calibration is raw 10..90, min ride 35 unless a scenario sets it.
 
@@ -47,7 +49,7 @@ Not modelled: bag hysteresis, tyre compliance, fast (adiabatic) compression, rea
 | Id | Scenario | Key checks |
 |---|---|---|
 | S1 | hill spot: crown + slope, connected 8 h, cooling, slow leak on a hanging corner | targets = preset plane + crown twist; hanging corners never dumped; compressed corners never pushed flat; leak refilled; no false latch |
-| S2 | 30 min mixed driving (sweepers, braking, a 3-min spiral ramp, highway, red lights); a blind-detector variant | zero corrections and pulses while moving |
+| S2 | 30 min mixed driving (sweepers, braking, a 3-min spiral ramp, highway, red lights); a blind-detector variant; 20 min of rough hilly stretches that read 6 % low; 40 min of a calm road reading 15 % low | zero corrections and pulses while moving; no air for the rough road; at most ~10 % added per drive |
 | S3 | overnight leak below min ride, no BLE, reboot at 5 h, owner returns at 8 h; a "nothing persisted" variant; a corner bled below min ride by hand while parked | nothing moves without BLE; RD lifted into the deadband; only RD actuated; the bled corner lifted within ~5 s |
 | S4 | two rear passengers, 10 kg groceries, passengers leave | correction starts within 5 s of the last movement; rear lifted back; front untouched; groceries ignored; lowered back |
 | S5 | drive off in the middle of a correction | aborted within 1.5 s, valves closed |

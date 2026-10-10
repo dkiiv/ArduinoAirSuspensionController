@@ -51,6 +51,7 @@ All happen in normal use once the logger runs; only 3 needs doing on purpose.
 | `HCS_LOAD_FRAC` | known-weight events | between 10 kg (ignored) and one passenger (corrected) |
 | `HCS_DEADBAND_H` | parked spread, `RESULT` landing | a landed correction never re-triggers |
 | `HCS_ROAD_HEAVE_MIN` | `ROAD ... mean` on drives where nothing changed | above what a healthy car shows |
+| `HCS_ROAD_ROUGH_MAX` | `ROAD ... rough x` / `ROAD window rough (x)` on your smooth and rough roads (note which) | between your normal roads and the rough ones; the car must not rise on rough stretches |
 | `HCS_CALM_H` | `HCSD` h while driving straight | the 1-s wobble on straight roads plus margin |
 | `HCS_FILL_RATE_DEFAULT` | `RESULT ... IN open` | measured %/s (learned per corner anyway, and persisted) |
 | `HCS_ARRIVAL_QUIET_MS`, `HCS_CONFIRM_MS` | drive logs: longest stop-and-go stop, longest compression | longer than both |

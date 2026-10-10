@@ -173,6 +173,7 @@ private:
         bool hsOk, roadPending;
         float hS, pS, calmLo, calmHi;              // 1-s averages, calm band
         float sdH, roadDef, owe;                   // road window sum, last window's deficit, owed fill
+        float driveAdded;                          // owed by road windows this drive (capped at HCS_OWE_MAX)
         uint32_t pulsedMs;                         // IN-valve time pulsed since the last window
     };
 
@@ -204,7 +205,7 @@ private:
     bool roadDefValid;
     int pulseCorner;
     uint32_t sdN, calmSince, pulseStartAt, pulseEnd, pulseMs, pulseAt;
-    float pulseStep;
+    float pulseStep, sdAct;
     // persistence + logging
     bool dirty, persistImmediate;
     uint32_t lastPersistAt, thrHash[8], thrAt[8];
