@@ -5,9 +5,8 @@
 // adapter (heightControlSupervisor.cpp) feeds it sensor snapshots every 100 ms and executes its commands through the
 // existing Wheel goal routine. eval/hcs_sim.cpp compiles the same sources on a PC. Single-threaded.
 //   hcs_core.cpp      state machine, user override, corrections, persistence, logging
-//   hcs_sense.cpp     sample intake, sensor faults, motion detector
+//   hcs_sense.cpp     sample intake, sensor faults, motion detector, road-level windows while driving
 //   hcs_classify.cpp  parked evaluation: classify each corner, arbitrate, start a correction
-//   hcs_drive.cpp     while driving: road level and fill pulses
 // Docs: OASMan_ESP32/docs/height-control-supervisor.md
 
 #ifndef hcs_core_h
@@ -82,8 +81,7 @@ enum class Cmd : uint8_t
 {
     NONE,
     START, // autonomous goals on corners with g[i].active
-    ABORT, // stop goals / pulses on corners with g[i].active
-    PULSE  // fill pulse on the g[i].active corner for g[i].pulseMs
+    ABORT  // stop goals on corners with g[i].active
 };
 
 struct GoalRequest
@@ -92,7 +90,6 @@ struct GoalRequest
     int8_t dir;     // +1 fill only, -1 dump only
     uint8_t target; // height %
     float ceilH, floorH, ceilP;
-    uint16_t pulseMs;
 };
 
 struct Outputs
@@ -171,11 +168,9 @@ private:
         uint32_t batchOpenMs;
         // driving (drive)
         float autoAdded; // height added by our own fills since the user last set this corner: never left on the car
-        bool hsOk, roadPending;
-        float hS, pS, calmLo, calmHi;              // 1-s averages, calm band
-        float sdH, roadDef, owe;                   // road window sum, last window's deficit, owed fill
-        float driveAdded;                          // owed by road windows this drive (capped at HCS_OWE_MAX)
-        uint32_t pulsedMs;                         // IN-valve time pulsed since the last window
+        // road (sense)
+        bool roadPending;
+        float sdH, roadDef; // window sum; where it sat on the road vs the preset plane (+ = low)
     };
 
     Corner c[NC];
@@ -202,11 +197,10 @@ private:
     bool batchSettling, urgentPending, urgentBatch, ownAir;
     uint32_t batchStart, settleStart, batchT[HCS_MAX_BATCHES_PER_HOUR];
     int batchI;
-    // driving
+    // road windows
     bool roadDefValid;
-    int pulseCorner;
-    uint32_t sdN, calmSince, pulseStartAt, pulseEnd, pulseMs, pulseAt;
-    float pulseStep, sdAct;
+    uint32_t sdN;
+    float sdAct;
     // persistence + logging
     bool dirty, persistImmediate;
     uint32_t lastPersistAt, thrHash[8], thrAt[8];
@@ -232,6 +226,8 @@ private:
     void motionDetect();
     bool windowMean(int i, float &hm, float &pm, bool &pOk, bool &stable) const;
     uint32_t steadyRemaining(uint32_t confirmMs) const; // ms still needed; 0 = steady that long
+    void roadSample(const Inputs &in);
+    void roadWindow();
     bool pUsable(int i) const { return !c[i].pFault && c[i].ndp >= 3; }
     // hcs_classify.cpp
     void evaluate(const Inputs &in, Outputs &out, const char *kind, bool arrival);
@@ -240,9 +236,6 @@ private:
     const char *gate(const Inputs &in, int i, int8_t dir, bool pOk, float pm) const;
     void retargetArrival(const Inputs &in, const float *hm);
     bool planeDeficit(const float *h, float *d, const float *ref = nullptr) const;
-    // hcs_drive.cpp
-    void driveTick(const Inputs &in, Outputs &out);
-    void roadWindow();
 
     // helpers
     float floorBase(const Inputs &in, int i) const;

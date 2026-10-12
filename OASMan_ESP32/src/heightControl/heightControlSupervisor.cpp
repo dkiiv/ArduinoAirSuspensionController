@@ -1,6 +1,6 @@
 // Height Control Supervisor -- ESP32 adapter. The decisions live in hcs_*.cpp (platform independent, replayed on a
 // PC by eval/hcs_sim.cpp); this file only moves data between them and the hardware:
-//   wheel tasks' cached readings -> hcs::Inputs -> Core::tick (every 100 ms) -> START / ABORT / PULSE -> Wheel
+//   wheel tasks' cached readings -> hcs::Inputs -> Core::tick (every 100 ms) -> START / ABORT -> Wheel
 // Docs: OASMan_ESP32/docs/height-control-supervisor.md
 
 #include "heightControlSupervisor.h"
@@ -47,10 +47,6 @@ void hcsNotifyPresetLoad(int profileIndex)
 
 void hcsNotifyManual()
 {
-    for (int i = 0; i < hcs::NC; i++)
-    {
-        getWheel(i)->releaseAutonomousPulse(); // the user's valve command owns the solenoids from here
-    }
     evManual = true;
 }
 
@@ -123,12 +119,7 @@ static void applyOutputs(const hcs::Outputs &out)
         }
         else if (out.cmd == hcs::Cmd::ABORT)
         {
-            w->endAutonomousPulse();
             w->requestAutonomousAbort();
-        }
-        else if (out.cmd == hcs::Cmd::PULSE && g.dir > 0 && !w->startAutonomousPulse(g.pulseMs, g.ceilP))
-        {
-            Serial.printf("HCS wheel %d refused pulse\n", i);
         }
     }
 }

@@ -87,12 +87,10 @@ void Core::begin(uint32_t t, const PersistBlob *r, bool sh, LogFn lf)
 {
     memset((void *)this, 0, sizeof(*this)); // POD members only; non-zero defaults below
     now = bootAt = lastMotion = lastEvalAt = eventOpenSince = manualIdleSince = lastPersistAt = t;
-    calmSince = pulseEnd = pulseAt = t;
     shadow = sh;
     logFn = lf;
     st = State::INIT;
     bootPending = needEval = true; // first evaluation after boot uses the long (arrival) quiet
-    pulseCorner = -1;
     const uint32_t old = t - 2 * HOUR_MS; // "long ago" (unsigned maths)
     lastPostponeLogAt = old;
     for (int i = 0; i < HCS_MAX_BATCHES_PER_HOUR; i++)
@@ -249,9 +247,8 @@ void Core::tick(const Inputs &in, Outputs &out)
         return;
     }
     motionDetect();
-    driveTick(in, out);
-    if (out.cmd == Cmd::NONE)
-        tickInner(in, out);
+    roadSample(in);
+    tickInner(in, out);
     if (dirty && (persistImmediate || (now - lastPersistAt) >= HCS_PERSIST_MIN_INTERVAL_MS))
     {
         PersistBlob b;
@@ -292,15 +289,10 @@ void Core::tickInner(const Inputs &in, Outputs &out)
     bool user = pendingManual;
     const char *why = pendingManual ? (presetPending ? "preset load" : "manual command") : "valve activity";
     pendingManual = false;
-    if (user && pulseCorner >= 0)
-    {
-        logf("PULSE %s released: user command", CN[pulseCorner]);
-        pulseCorner = -1; // the adapter already handed the solenoids to the user
-    }
     for (int i = 0; i < NC; i++)
     {
         const CornerIn &x = in.c[i];
-        const bool mine = (st == State::CORRECTING && c[i].inBatch) || i == pulseCorner;
+        const bool mine = st == State::CORRECTING && c[i].inBatch;
         if ((x.routineActive && !x.routineAutonomous) || ((x.inOpen || x.outOpen) && !x.routineActive && !mine))
             user = c[i].touched = true;
     }
@@ -431,7 +423,7 @@ void Core::tickManual(const Inputs &in)
         }
         k.leakFault = k.leakAllowance = k.roadPending = false;
         k.fastCount = 0;
-        k.owe = k.autoAdded = 0;
+        k.autoAdded = 0;
         logf("COMMIT %s %s tgt=%.1f pRef=%.1f%s", CN[i], presetPending ? "preset" : "manual", k.tgt, k.pRef,
              k.floorOverride >= 0 ? " (user-held below min ride)" : "");
     }

@@ -1,4 +1,4 @@
-// HCS sensing: sample intake, electrical sensor faults, motion detector. See hcs_core.h.
+// HCS sensing: sample intake, electrical sensor faults, motion detector, road-level windows. See hcs_core.h.
 
 #include "hcs_core.h"
 
@@ -230,7 +230,7 @@ void Core::motionDetect()
             sdN = 0;
             sdAct = 0;
             for (int i = 0; i < NC; i++)
-                c[i].roadPending = false, c[i].sdH = c[i].owe = c[i].driveAdded = 0, c[i].pulsedMs = 0;
+                c[i].roadPending = false, c[i].sdH = 0;
             if (externalFreeze)
             {
                 externalFreeze = false; // a car on a jack is not driving (the unloaded wheel was uneven ground)
@@ -268,6 +268,53 @@ uint32_t Core::steadyRemaining(uint32_t confirmMs) const
             need = confirmMs - age;
     }
     return need;
+}
+
+// ---- road level: while driving, each corner's average height over HCS_ROAD_WINDOW_MS (no corner moving air). The road
+// is level on average, so where the car sat versus the preset plane (twist removed) is an AIR / load fact the arrival
+// evaluation can act on (ROAD). A rough road biases the average (packing, nonlinearity): such windows are dropped.
+void Core::roadSample(const Inputs &in)
+{
+    if (!driving)
+        return;
+    float act = 0;
+    for (int i = 0; i < NC; i++)
+    {
+        const Corner &k = c[i];
+        if (k.hFault || k.busy || (now - k.idleSince) < HCS_P_SETTLE_MS)
+            return;
+        act += 0.25f * k.actH / HCS_MOTION_H_THRESH;
+    }
+    for (int i = 0; i < NC; i++)
+        c[i].sdH += in.c[i].h;
+    sdAct += act;
+    if (++sdN * (uint32_t)HCS_TICK_MS >= HCS_ROAD_WINDOW_MS)
+        roadWindow();
+}
+
+void Core::roadWindow()
+{
+    float hmean[NC], ref[NC], d[NC];
+    for (int i = 0; i < NC; i++)
+    {
+        hmean[i] = c[i].sdH / sdN;
+        ref[i] = presetValid ? (float)presetH[i] : c[i].tgt;
+        c[i].sdH = 0;
+    }
+    const float rough = sdAct / sdN;
+    sdN = 0;
+    sdAct = 0;
+    if (rough > HCS_ROAD_ROUGH_MAX)
+    {
+        logq("ROAD window rough (%.1f) -> ignored", rough);
+        return;
+    }
+    roadDefValid = planeDeficit(hmean, d, ref);
+    if (!roadDefValid)
+        return;
+    for (int i = 0; i < NC; i++)
+        c[i].roadDef = d[i];
+    logq("ROAD level vs preset (+ = low): FP %+.1f RP %+.1f FD %+.1f RD %+.1f, rough %.1f", d[C_FP], d[C_RP], d[C_FD], d[C_RD], rough);
 }
 
 } // namespace hcs

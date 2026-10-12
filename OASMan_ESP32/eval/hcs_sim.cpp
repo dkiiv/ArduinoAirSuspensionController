@@ -25,7 +25,6 @@
 #include "../src/heightControl/hcs_core.cpp"
 #include "../src/heightControl/hcs_sense.cpp"
 #include "../src/heightControl/hcs_classify.cpp"
-#include "../src/heightControl/hcs_drive.cpp"
 
 #include <cmath>
 #include <cstdio>
@@ -95,11 +94,7 @@ struct Sim
     float rawFault[4] = {NAN, NAN, NAN, NAN}; // forced raw height (wire break)
     bool manualIn[4] = {false, false, false, false};
     Routine r[4];
-    uint32_t pulseUntil[4] = {0, 0, 0, 0};
     uint32_t seq = 0;
-    int pulses = 0, pulsesInEvent = 0, pulsesOn[4] = {0, 0, 0, 0};
-    float pulseRoll[4] = {99, 99, 99, 99}, pulsePitch[4] = {0, 0, 0, 0};
-    uint32_t pulseMsTotal = 0;
 
     // calibration
     float calMin = 10, calMax = 90, minRide = 35;
@@ -231,18 +226,7 @@ struct Sim
         for (int i = 0; i < 4; i++)
         {
             Routine &R = r[i];
-            bool pulsing = pulseUntil[i] != 0 && (int32_t)(t - pulseUntil[i]) < 0;
-            if (pulseUntil[i] != 0 && !pulsing)
-                pulseUntil[i] = 0;
-            if (pulsing && pulseRoll[i] > 9.0f)
-                pulseRoll[i] = roll, pulsePitch[i] = pitch; // body state when the pulse started
-            if (pulsing && (fabsf(roll - pulseRoll[i]) > 0.01f || fabsf(pitch - pulsePitch[i]) > 0.01f))
-                pulsesInEvent++; // still open after a curve / brake began
-            if (!pulsing)
-                pulseRoll[i] = 99.0f;
-            if (pulsing)
-                pulseMsTotal += dtMs;
-            bool inOpen = manualIn[i] || pulsing, outOpen = false;
+            bool inOpen = manualIn[i], outOpen = false;
             if (R.active)
             {
                 bool stop = (t - R.start) > (R.autonomous ? (uint32_t)HCS_ROUTINE_TIMEOUT_MS : 15000u);
@@ -295,15 +279,15 @@ struct Sim
             float hm = h[i] + 0.15f * N(rng) + road + (moving ? readBias : 0.0f);
             float hmc = hm < 0 ? 0 : (hm > 100 ? 100 : hm);
             float pm = p[i] + 0.25f * N(rng) + proad;
-            bool vo = manualIn[i] || r[i].active || pulseUntil[i] != 0;
-            if (vo && (manualIn[i] || pulseUntil[i] != 0 || r[i].dir > 0))
+            bool vo = manualIn[i] || r[i].active;
+            if (vo && (manualIn[i] || r[i].dir > 0))
                 pm += 0.4f * (tank - p[i]); // flow offset
             if (vo && r[i].dir < 0 && !manualIn[i])
                 pm *= 0.7f;
             in.c[i].h = hmc;
             in.c[i].hRaw = std::isnan(rawFault[i]) ? calMin + hm * (calMax - calMin) / 100.0f : rawFault[i];
             in.c[i].p = pm;
-            in.c[i].inOpen = manualIn[i] || pulseUntil[i] != 0 || (r[i].active && r[i].dir > 0);
+            in.c[i].inOpen = manualIn[i] || (r[i].active && r[i].dir > 0);
             in.c[i].outOpen = r[i].active && r[i].dir < 0;
             in.c[i].routineActive = r[i].active;
             in.c[i].routineAutonomous = r[i].active && r[i].autonomous;
@@ -357,32 +341,11 @@ struct Sim
         }
         else if (out.cmd == Cmd::ABORT)
         {
-            bool wasPulse = false;
             for (int i = 0; i < 4; i++)
-            {
-                if (out.g[i].active && pulseUntil[i] != 0)
-                {
-                    pulseUntil[i] = 0;
-                    wasPulse = true;
-                }
                 if (out.g[i].active && r[i].autonomous)
                     r[i].active = false;
-            }
-            if (!wasPulse)
-            {
-                aborts++;
-                lastAbortAt = t;
-            }
-        }
-        else if (out.cmd == Cmd::PULSE)
-        {
-            for (int i = 0; i < 4; i++)
-                if (out.g[i].active)
-                {
-                    pulseUntil[i] = t + out.g[i].pulseMs + 100; // adapter closes on the core's ABORT, +1 tick
-                    pulses++;
-                    pulsesOn[i]++;
-                }
+            aborts++;
+            lastAbortAt = t;
         }
         if (out.persistNow && core.exportPersist(blob))
             haveBlob = true;
@@ -480,7 +443,7 @@ static void parkedAtPreset(Sim &s)
 // R4 + 3 a.m. challenge: hill spot, phone connected all night, cooling, then a slow leak on an extended corner
 static void scenarioHill()
 {
-    printf("\nS1 hill spot (crown + slope), phone connected overnight, cooling, slow leak on an extended corner\n");
+    printf("\nS1 hill spot (crown + slope), phone connected overnight, cooling, slow leaks on a hanging and a compressed corner\n");
     Sim s;
     g_log.clear();
     parkedAtPreset(s);
@@ -504,8 +467,9 @@ static void scenarioHill()
     int startsBefore = s.starts;
     // cool down over 3 h (6 % of gas temperature)
     s.run(3 * 3600, [](Sim &x) { if (x.T > 0.97f) x.T -= 0.06f / (3600 * 10); });
-    // slow leak on RP (an extended, low-pressure corner) for 5 h
+    // slow leaks for 5 h: RP (hanging, low pressure) and RD (compressed at 100+ psi: the owner's corner)
     s.leakPerHour[C_RP] = 0.015f; // ~1.5 %/h of the air: a slow leak (about 12 % overnight)
+    s.leakPerHour[C_RD] = 0.02f;
     s.run(5 * 3600);
     float worst = 0;
     for (int i = 0; i < 4; i++)
@@ -514,7 +478,8 @@ static void scenarioHill()
            s.fillsOn[C_RP]);
     check(worst <= HCS_DEADBAND_H + 1.0f && s.dumpsOn[C_FD] == 0 && s.dumpsOn[C_RP] == 0 && s.h[C_FP] < 46 && s.h[C_RD] < 48, "S1",
           fmt("held at its arrival geometry: hanging corners never dumped, compressed ones never pushed flat (worst %.1f%%)", worst));
-    check(s.fillsOn[C_RP] >= 1, "S1", "slow leak on RP refilled toward its arrival height");
+    check(s.fillsOn[C_RP] >= 1 && s.fillsOn[C_RD] >= 1 && countLog("FAST leak latched") == 0, "S1",
+          "both slow leaks refilled toward their arrival heights, neither latched as a burst bag");
 }
 
 // R5: driving / cornering / braking / smooth highway / red lights, with a leak and a passenger tempting the classifier
@@ -540,7 +505,7 @@ static void scenarioDriving()
     }
     printf("  starts while moving=%d, valve-ms while moving=%u, DRIVING confirmations=%d, total starts=%d\n", s.startsWhileMoving,
            s.valveMsWhileMoving, countLog("DRIVING confirmed"), s.starts);
-    check(s.startsWhileMoving == 0 && s.valveMsWhileMoving == 0 && s.pulses == 0, "S2",
+    check(s.startsWhileMoving == 0 && s.valveMsWhileMoving == 0, "S2",
           "zero autonomous actuation while moving incl. road top-up (cornering, braking, spiral ramp, highway)");
     check(s.starts == 0, "S2", "no actuation at 60 s red lights either (arrival quiet = 120 s)");
 
@@ -557,14 +522,14 @@ static void scenarioDriving()
     check(b.starts == 0, "S2", fmt("blind-detector cornering classified as SHIFT, never actuated (starts=%d, SHIFT lines=%d)", b.starts,
                                     countLog("SHIFT")));
 
-    // a long rough, hilly highway stretch where the AVERAGE reading sits 6 % low (rebound damping packs the car down,
-    // linkage / spring nonlinearity), then smooth highway: no air may be added for it
+    // a 40 min drive whose readings sit 6-15 % low (rebound packing on rough stretches, linkage nonlinearity): the
+    // field build that topped up from such readings rose +16 %. Nothing may open while moving, whatever the reading.
     Sim r;
     g_log.clear();
     parkedAtPreset(r);
     float tt = 0;
     r.moving = true;
-    r.run(1200, [&](Sim &x) { // 20 min: 90 s rough + swells (reads low), 30 s smooth, repeated
+    r.run(1200, [&](Sim &x) { // 20 min: 90 s rough + swells (reads 6 % low), 30 s smooth, repeated
         tt += 0.1f;
         const bool rough = fmodf(tt, 120.0f) < 90.0f;
         x.rough = rough ? 1.6f : 0.35f;
@@ -572,30 +537,16 @@ static void scenarioDriving()
         x.heave = rough ? 0.12f * sinf(2 * 3.14159f * 0.2f * tt) : 0.0f;
     });
     r.heave = 0;
+    r.readBias = -15.0f;
+    r.drive(1200, 0.35f, true, 150.0f); // 20 min calm highway reading 15 % low
     r.readBias = 0;
-    r.drive(600, 0.35f, true, 150.0f); // 10 min smooth highway
     r.roll = r.pitch = 0;
     r.solve();
     float hiR = 0;
     for (int i = 0; i < 4; i++)
         hiR = fmaxf(hiR, r.h[i] - 50);
-    printf("  20 min rough + hilly stretches (read 6 %% low) with calm gaps, then smooth: pulses %d, highest corner %+.1f vs preset\n", r.pulses, hiR);
-    check(r.pulses == 0 && hiR <= HCS_DEADBAND_H, "S2", "a rough road that only reads low adds no air");
-
-    // a bias the gates cannot see (reads 15 % low on a calm road for 40 min): the per-drive cap bounds it
-    Sim q;
-    g_log.clear();
-    parkedAtPreset(q);
-    q.readBias = -15.0f;
-    q.drive(2400, 0.35f, true, 150.0f);
-    q.readBias = 0;
-    q.roll = q.pitch = 0;
-    q.solve();
-    float hiQ = 0;
-    for (int i = 0; i < 4; i++)
-        hiQ = fmaxf(hiQ, q.h[i] - 50);
-    printf("  40 min calm road reading 15 %% low: pulses %d, highest corner %+.1f vs preset\n", q.pulses, hiQ);
-    check(hiQ <= 12.0f, "S2", "whatever the reading, a drive adds about 10 % per corner at most (cap + open-loop pulse error)");
+    printf("  40 min of roads reading 6-15 %% low: valve ms while moving %u, highest corner %+.1f vs preset\n", r.valveMsWhileMoving, hiR);
+    check(r.valveMsWhileMoving == 0 && hiR <= HCS_DEADBAND_H, "S2", "readings that sit low on the road add no air");
 }
 
 // Suspected bug: leak below min ride overnight with no BLE, reboot in between, owner returns
@@ -854,73 +805,29 @@ static void scenarioShowMode()
     check(s.starts == 0, "S11b", fmt("show preset held: zero autonomous actuation in 2 h (starts=%d)", s.starts));
     check(countLog("FAULT") == 0, "S11b", "no false sensor fault on empty bags");
 }
-
-// The owner's real leak: rear driver (RD) on the hill spot, compressed overnight, ~1-2 psi/h
-static void scenarioOwnersLeak()
-{
-    printf("\nS14 owner's leak: RD compressed on the hill spot, 2 %%/h of its air, 24 h connected\n");
-    Sim s;
-    g_log.clear();
-    parkedAtPreset(s);
-    s.drive(300, 0.8f);
-    s.moving = true;
-    s.rough = 0.6f;
-    s.run(8, [](Sim &x) { x.warp += 9.0f / 80; });
-    s.rough = 0;
-    s.moving = false;
-    s.run(300);
-    float arrRD = s.h[C_RD];
-    s.leakPerHour[C_RD] = 0.02f;
-    float worstRD = 0;
-    s.run(24 * 3600, [&](Sim &x) { worstRD = fmaxf(worstRD, arrRD - x.h[C_RD]); });
-    printf("  RD arrival %.1f, now %.1f, worst sag %.1f, RD fills=%d, latched=%d\n", arrRD, s.h[C_RD], worstRD, s.fillsOn[C_RD],
-           countLog("FAST leak latched"));
-    check(countLog("FAST leak latched") == 0, "S14", "slow leak never latched");
-    check(worstRD <= HCS_DEADBAND_H + 1.0f, "S14", fmt("RD held at its arrival height all day (worst sag %.1f)", worstRD));
-}
-
-// Road trip: 4 h of continuous driving with a slow leak -> road-level pulses keep the corner up, only when calm
+// Road trip: 4 h of continuous driving with a slow leak. Nothing is corrected while driving (by design: the open-loop
+// top-up was removed after the car rose in the field); the leak is made up at the next stop.
 static void scenarioRoadTrip()
 {
     printf("\nS15 road trip: 4 h non-stop, RD leaking 2.5 %%/h of its air; 5 min twisty / 5 min highway alternating\n");
     Sim s;
     g_log.clear();
     parkedAtPreset(s);
-    // one parked correction first so the RD fill rate is learned (as it would be in daily use)
-    s.disturbance(6);
-    s.extraF[C_RD] += 0.10f;
-    s.run(120);
-    s.disturbance(6);
-    s.extraF[C_RD] -= 0.10f;
-    s.run(900);
     s.leakPerHour[C_RD] = 0.025f;
-    float worstLate = 0;
-    float mStart = s.m[C_RD];
     for (int seg = 0; seg < 24; seg++) // 24 x 10 min
     {
-        s.drive(300, 0.8f, true);         // twisty: a sweeper / brake event every minute
+        s.drive(300, 0.8f, true);          // twisty: a sweeper / brake event every minute
         s.drive(300, 0.35f, true, 150.0f); // highway: an event every 2.5 min
-        if (seg >= 6)
-        {
-            float others = (s.h[C_FP] + s.h[C_RP] + s.h[C_FD]) / 3.0f;
-            worstLate = fmaxf(worstLate, others - s.h[C_RD]);
-        }
     }
-    printf("  pulses: FP=%d RP=%d FD=%d RD=%d (total %u ms), 100 ms ticks a pulse stayed open after a curve / brake began: %d\n", s.pulsesOn[0], s.pulsesOn[1],
-           s.pulsesOn[2], s.pulsesOn[3], s.pulseMsTotal, s.pulsesInEvent);
-    printf("  RD air lost %.1f%% to the leak; worst RD deficit vs others after the first hour: %.1f%%\n", (mStart - s.m[C_RD]) * 100.0f,
-           worstLate);
     s.roll = s.pitch = 0;
     s.solve();
-    printf("  static now: h FP=%.1f RP=%.1f FD=%.1f RD=%.1f | p FP=%.1f RP=%.1f FD=%.1f RD=%.1f\n", s.h[0], s.h[1], s.h[2], s.h[3], s.p[0],
-           s.p[1], s.p[2], s.p[3]);
-    const int np = s.pulsesOn[0] + s.pulsesOn[1] + s.pulsesOn[2] + s.pulsesOn[3];
-    if (HCS_DRIVE_TOPUP)
-        check(s.pulsesOn[C_RD] >= 1 && np == s.pulsesOn[C_RD] && s.startsWhileMoving == 0 && s.pulsesInEvent <= 3 * np, "S15",
-              "pulses only, on the leaking corner only; one caught by a curve / brake starting is cut within 0.3 s");
-    else
-        check(np == 0 && s.startsWhileMoving == 0, "S15", "drive top-up off: nothing actuates on a 4 h trip");
-    check(worstLate <= 6.0f, "S15", fmt("RD kept within %.1f%% of the others (no top-up: grows ~1.5 %%/h)", worstLate));
+    const float others = (s.h[C_FP] + s.h[C_RP] + s.h[C_FD]) / 3.0f;
+    printf("  after 4 h: RD %.1f vs others %.1f; valve ms while moving %u\n", s.h[C_RD], others, s.valveMsWhileMoving);
+    check(s.startsWhileMoving == 0 && s.valveMsWhileMoving == 0, "S15", "nothing actuates on a 4 h trip");
+    s.drive(8, 0.3f, false);
+    s.run(600);
+    printf("  10 min after stopping: RD %.1f\n", s.h[C_RD]);
+    check(fabsf(s.h[C_RD] - 50) <= HCS_DEADBAND_H, "S15", "the trip's leak is made up at the next stop");
 }
 
 // Dips / the bottom of a hill at speed: all four corners compress and every bag pressure rises together.
@@ -958,7 +865,7 @@ static void scenarioDips()
         const int wanted = countLog("wanted, confirming");
         printf("  %s: deepest compression %.1f%% (preset 50), DRIVING confirmed %d, corrections held for confirmation %d\n", NAME[cs],
                minH, countLog("DRIVING confirmed"), wanted);
-        roadsQuiet = roadsQuiet && s.startsWhileMoving == 0 && s.valveMsWhileMoving == 0 && s.pulses == 0;
+        roadsQuiet = roadsQuiet && s.startsWhileMoving == 0 && s.valveMsWhileMoving == 0;
         if (cs == 2)
             check(wanted > 0, "S16", "long sags: the confirmation rule was exercised (an evaluation saw the sag) and held");
         if (cs != 0)
@@ -973,7 +880,7 @@ static void scenarioDips()
         check(s.starts > st0 && fabsf(s.h[C_RP] - 50) <= HCS_DEADBAND_H && fabsf(s.h[C_RD] - 50) <= HCS_DEADBAND_H, "S16",
               fmt("weight added after parking is still compensated (RP %.1f RD %.1f)", s.h[C_RP], s.h[C_RD]));
     }
-    check(roadsQuiet, "S16", "no fill / dump / pulse in 15 min on any of the three roads");
+    check(roadsQuiet, "S16", "no fill / dump in 15 min on any of the three roads");
     // the detector is BLIND to steady driving (glassy highway) but sees each bump: after a detected drive, 20 min of
     // highway where every 60 s a bump (4 s, seen) is followed by a sag whose flat bottom (5 s) outlasts the fast
     // confirmation but not the normal one. A bump must not count as "people got in" unless the car was known parked.
@@ -1034,7 +941,7 @@ static void scenarioShadow()
     s.extraF[C_RP] += 0.18f;
     s.run(5400);
     printf("  SHADOW would START lines: %d, starts=%d, RD now %.1f\n", countLog("SHADOW would START"), s.starts, s.h[C_RD]);
-    check(s.starts == 0 && s.pulses == 0, "S17", "no actuation at all");
+    check(s.starts == 0, "S17", "no actuation at all");
     check(countLog("SHADOW would START") > 0, "S17", "the decisions it would have taken are logged");
     check(countLog("FAST leak latched") == 0 && countLog("LEAK RD refill") == 0, "S17", "no leak bookkeeping from decisions that never ran");
 }
@@ -1082,28 +989,15 @@ static void scenarioGetInAndDrive()
             continue;
         }
         s.run(8); // pull away 8 s after sitting down
-        const int pulses0 = s.pulses;
         // 15 min drive, ending either on flat ground or back on the crown
         if (dest == 0)
             s.run(4, [](Sim &x) { x.warp -= 9.0f / 40; x.pitch -= 0.04f / 40; });
         s.drive(900, 0.6f);
-        if (dest == 0)
-        {
-            // still on the road: the load added before leaving must already be made up (not only after parking)
-            const float twR = 0.25f * (s.h[C_FP] + s.h[C_RD] - s.h[C_FD] - s.h[C_RP]), sgR[4] = {+1, -1, -1, +1};
-            float worstR = 0;
-            for (int i = 0; i < 4; i++)
-                worstR = fmaxf(worstR, fabsf(s.h[i] - sgR[i] * twR - 50));
-            printf("  end of the drive: FP %.1f RP %.1f FD %.1f RD %.1f\n", s.h[0], s.h[1], s.h[2], s.h[3]);
-            if (HCS_DRIVE_TOPUP)
-                check(worstR <= HCS_DEADBAND_H + 0.5f, "S18", fmt("level while still driving: the drive-away top-up made up the load (worst %.1f)", worstR));
-        }
         s.drive(8, 0.3f, false);
         s.run(300);
         const float wp = 0.25f * (s.h[C_FP] + s.h[C_RD] - s.h[C_FD] - s.h[C_RP]);
-        printf("  %s: drive-away pulses %d (RP %d RD %d FD %d FP %d); after arrival FP %.1f RP %.1f FD %.1f RD %.1f (twist %+.1f)\n",
-               dest == 0 ? "arrive on flat ground" : "arrive back home on the crown", s.pulses - pulses0, s.pulsesOn[C_RP], s.pulsesOn[C_RD],
-               s.pulsesOn[C_FD], s.pulsesOn[C_FP], s.h[C_FP], s.h[C_RP], s.h[C_FD], s.h[C_RD], wp);
+        printf("  %s: after arrival FP %.1f RP %.1f FD %.1f RD %.1f (twist %+.1f)\n", dest == 0 ? "arrive on flat ground" : "arrive back home on the crown",
+               s.h[C_FP], s.h[C_RP], s.h[C_FD], s.h[C_RD], wp);
         float plane[4];
         {
             // plane part of the heights (twist removed) vs the preset plane (50 everywhere)
@@ -1257,7 +1151,7 @@ int main(int argc, char **argv)
     } const all[] = {{"S1", scenarioHill},       {"S2", scenarioDriving},     {"S3", scenarioLeakBelowMin}, {"S4", scenarioLoad},
                      {"S5", scenarioDriveOffMidFill}, {"S6", scenarioNoPresence}, {"S7", scenarioFaults},  {"S8", scenarioJack},
                      {"S9", scenarioManual},     {"S10", scenarioFastLeak},   {"S11b", scenarioShowMode},
-                     {"S14", scenarioOwnersLeak}, {"S15", scenarioRoadTrip},    {"S16", scenarioDips},
+                     {"S15", scenarioRoadTrip},    {"S16", scenarioDips},
                      {"S17", scenarioShadow},
                      {"S18", scenarioGetInAndDrive},
                      {"S19", scenarioSevereSpot}};
