@@ -1,28 +1,46 @@
 # HCS field data: what to record on the car, and why
 
-Most supervisor thresholds are estimates (ESTIMATE in `hcs_config.h`). These recordings turn them into measured values, in priority order. All of it comes from the **shadow build**: it runs the supervisor and logs every decision but **never actuates**; the legacy maintain keeps driving the car as today.
+Most supervisor thresholds are estimates (ESTIMATE in `hcs_config.h`). These recordings turn them into measured values, in priority order. Two builds log the same lines: the **shadow build** decides but **never actuates** (legacy maintain drives the car), the **diag build** is the live supervisor plus the 1 Hz dump. A car already driving on the supervisor records with diag.
 
 ## 1. Setup (once)
 
-1. Flash the shadow build (USB): `version_num=test release_tag_name=build-local ~/.venvs/pio/bin/pio run -e manifold_v4_hcs_shadow -t upload` (from `OASMan_ESP32/`).
+1. Flash (USB, from `OASMan_ESP32/`): `version_num=test release_tag_name=build-local ~/.venvs/pio/bin/pio run -e manifold_v4_diag -t upload` (or `manifold_v4_hcs_shadow`).
 2. In the app: height-sensor mode **on**, "maintain" **on**, min ride calibrated.
 3. Record the manifold's USB serial port (115200 baud); nothing is stored on the board.
 
-### Recording on the comma (always powered, Linux, lots of storage)
+### Recording on a Raspberry Pi Zero W under the hood
 
-`eval/hcs_logger.py` (stdlib-only Python) timestamps every line, writes one file per day, reconnects after an unplug or a manifold reboot, keeps 60 days, and opens the port **without toggling DTR/RTS** (on most ESP32 boards those reset the chip). It keeps only `HCS t=` (decisions), `HCSD` (1 Hz state) and `HRAW` (raw sensor volts) lines.
+A Zero W (v1, single core) is enough: the logger is stdlib Python at a few hundred lines per second. It needs its own 5 V; the ESP32's USB port is a device port and does not source power.
 
-1. **Cable** from the manifold's USB port to the comma's AUX USB-C port. Do the first test parked: some boards still reset once when the port opens (safe: valves close, targets reload).
-2. **Device:** over SSH, `ls /dev/ttyUSB* /dev/ttyACM*`. If nothing appears, that kernel lacks the driver; a Raspberry Pi Zero 2 W on the same cable runs the same script.
-3. **Logger:**
+1. **SD card:** Raspberry Pi Imager, *Raspberry Pi OS Lite (32-bit)* (the v1 Zero is ARMv6: 64-bit images do not boot). In the Imager settings: hostname `hcs-pi`, enable SSH, a user, the home Wi-Fi (2.4 GHz only on a Zero W), timezone.
+2. **Power:** a 12 V -> 5 V buck converter (automotive type, 2-3 A) on the same always-on 12 V feed as the manifold, into the Pi's **PWR IN** micro-USB (the port at the board's edge). Draw is ~0.2 A at 5 V.
+3. **Data:** the Pi is the USB host, so the OTG adapter goes on its side: Pi **USB** port (the inner micro-USB) -> micro-USB OTG adapter (micro-B male to USB-A female) -> USB-A to USB-C cable -> ESP32. Connect the ESP32 end while parked: enumeration can reset the board once (valves close, targets reload).
+4. **Logger as a service** (survives power cycles):
    ```
-   scp eval/hcs_logger.py comma@<comma-ip>:/data/hcs_logger.py
-   ssh comma@<comma-ip> 'mkdir -p /data/hcs_logs; nohup python3 /data/hcs_logger.py --dir /data/hcs_logs > /data/hcs_logs/logger.out 2>&1 &'
+   scp eval/hcs_logger.py <user>@hcs-pi.local:
+   ssh <user>@hcs-pi.local
+   sudo usermod -aG dialout $USER
+   sudo tee /etc/systemd/system/hcs-logger.service >/dev/null <<EOF
+   [Unit]
+   Description=HCS serial logger
+   After=multi-user.target
+   [Service]
+   User=$USER
+   ExecStart=/usr/bin/python3 /home/$USER/hcs_logger.py --dir /home/$USER/hcs_logs
+   Restart=always
+   RestartSec=5
+   [Install]
+   WantedBy=multi-user.target
+   EOF
+   sudo systemctl enable --now hcs-logger
    ```
-   `/data` survives reboots and updates; the process does not unless your openpilot fork's launch script starts it.
-4. **Collect:** `scp 'comma@<comma-ip>:/data/hcs_logs/hcs-*.log' .` (about 20-25 MB per day).
+   Check: `ls /dev/ttyUSB* /dev/ttyACM*` shows the manifold; `tail -f ~/hcs_logs/hcs-*.log` shows `HCSD` lines once a second.
+5. **Clock:** the Pi has no RTC. Its clock is right once it has seen the home Wi-Fi (NTP) and stays right while powered; after a power loss it resumes from the last saved time until the next sync. The `HCS t=` counter is uptime in ms, so intervals are always right.
+6. **Collect** (in the driveway): `scp '<user>@hcs-pi.local:hcs_logs/hcs-*.log' .` -- about 20-25 MB per day; the logger keeps 60 days.
 
-Short sessions with a laptop: `pio device monitor -b 115200 -f time -f log2file`, or the same script.
+### The logger
+
+`eval/hcs_logger.py` (stdlib-only Python, Linux) timestamps every line, writes one file per day, reconnects after an unplug or a manifold reboot, keeps 60 days, and opens the port **without toggling DTR/RTS** (on most ESP32 boards those reset the chip). It keeps only `HCS t=` (decisions), `HCSD` (1 Hz state) and `HRAW` (raw sensor volts) lines. The same script runs on a comma device (AUX USB-C port, `/data`) if its kernel has the USB-serial driver. Short sessions with a laptop: `pio device monitor -b 115200 -f time -f log2file`.
 
 ### What the log contains (and what it does not)
 
