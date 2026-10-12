@@ -206,7 +206,7 @@ void Core::roadWindow()
         k.roadDef = d[i];
         heave += 0.25f * d[i];
     }
-    const bool low = heave > HCS_ROAD_HEAVE_MIN && !externalFreeze;
+    const bool low = HCS_DRIVE_TOPUP && heave > HCS_ROAD_HEAVE_MIN && !externalFreeze;
     logq("ROAD level vs preset (+ = low): FP %+.1f RP %+.1f FD %+.1f RD %+.1f, mean %+.1f, rough %.1f%s", d[C_FP], d[C_RP], d[C_FD],
          d[C_RD], heave, rough, low ? " -> sits low: top up" : "");
     // the corners carrying it: at least half the worst deficit (a leaking bag's neighbours show ~1/3 of its deficit

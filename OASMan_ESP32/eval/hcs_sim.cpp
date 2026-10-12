@@ -661,6 +661,7 @@ static void scenarioLoad()
     Sim s;
     g_log.clear();
     parkedAtPreset(s);
+    s.run(150); // parked a while (the fast confirmation needs the car still for 2 min since it last drove)
     s.disturbance(10);
     s.extraF[C_RP] += 0.09f;
     s.extraF[C_RD] += 0.09f;
@@ -914,8 +915,11 @@ static void scenarioRoadTrip()
     printf("  static now: h FP=%.1f RP=%.1f FD=%.1f RD=%.1f | p FP=%.1f RP=%.1f FD=%.1f RD=%.1f\n", s.h[0], s.h[1], s.h[2], s.h[3], s.p[0],
            s.p[1], s.p[2], s.p[3]);
     const int np = s.pulsesOn[0] + s.pulsesOn[1] + s.pulsesOn[2] + s.pulsesOn[3];
-    check(s.pulsesOn[C_RD] >= 1 && np == s.pulsesOn[C_RD] && s.startsWhileMoving == 0 && s.pulsesInEvent <= 3 * np, "S15",
-          "pulses only, on the leaking corner only; one caught by a curve / brake starting is cut within 0.3 s");
+    if (HCS_DRIVE_TOPUP)
+        check(s.pulsesOn[C_RD] >= 1 && np == s.pulsesOn[C_RD] && s.startsWhileMoving == 0 && s.pulsesInEvent <= 3 * np, "S15",
+              "pulses only, on the leaking corner only; one caught by a curve / brake starting is cut within 0.3 s");
+    else
+        check(np == 0 && s.startsWhileMoving == 0, "S15", "drive top-up off: nothing actuates on a 4 h trip");
     check(worstLate <= 6.0f, "S15", fmt("RD kept within %.1f%% of the others (no top-up: grows ~1.5 %%/h)", worstLate));
 }
 
@@ -970,6 +974,50 @@ static void scenarioDips()
               fmt("weight added after parking is still compensated (RP %.1f RD %.1f)", s.h[C_RP], s.h[C_RD]));
     }
     check(roadsQuiet, "S16", "no fill / dump / pulse in 15 min on any of the three roads");
+    // the detector is BLIND to steady driving (glassy highway) but sees each bump: after a detected drive, 20 min of
+    // highway where every 60 s a bump (4 s, seen) is followed by a sag whose flat bottom (5 s) outlasts the fast
+    // confirmation but not the normal one. A bump must not count as "people got in" unless the car was known parked.
+    Sim r;
+    g_log.clear();
+    parkedAtPreset(r);
+    r.drive(120, 0.6f); // a detected drive: the car is NOT known to be parked from here on
+    r.moving = true;
+    float tr = 0;
+    r.run(1200, [&](Sim &x) {
+        tr += 0.1f;
+        const float ph = fmodf(tr, 60.0f);
+        x.rough = ph < 4.0f ? 1.5f : 0.0f;
+        x.heave = (ph >= 6.0f && ph < 8.0f) ? 0.12f * (ph - 6.0f) / 2.0f : (ph >= 8.0f && ph < 13.0f) ? 0.12f : (ph >= 13.0f && ph < 15.0f) ? 0.12f * (15.0f - ph) / 2.0f : 0.0f;
+    });
+    r.heave = 0;
+    r.rough = 0;
+    r.moving = false;
+    r.solve();
+    float hiB = 0;
+    for (int i = 0; i < 4; i++)
+        hiB = fmaxf(hiB, r.h[i] - 50);
+    printf("  blind highway after a detected drive, bumps then flat sags: fills %d, highest corner %+.1f vs preset after 20 min\n", r.starts, hiB);
+    check(r.starts == 0, "S16", "a bump on a road the detector otherwise misses is not \"people got in\" (no fill in the sag after it)");
+
+    // and when a fill does slip through (a 20 s flat-bottomed sag holds the car still), it is taken back once the car
+    // sits high again: air added by the supervisor is never permanent
+    Sim u;
+    g_log.clear();
+    parkedAtPreset(u);
+    u.run(200);
+    u.moving = true;
+    u.run(20, [](Sim &x) { x.heave = 0.12f; });
+    u.heave = 0;
+    const int filled = u.starts;
+    u.run(900);
+    u.moving = false;
+    u.solve();
+    float hiU = 0;
+    for (int i = 0; i < 4; i++)
+        hiU = fmaxf(hiU, u.h[i] - 50);
+    printf("  blind 20 s flat sag: fills %d; 15 min later highest corner %+.1f vs preset\n", filled, hiU);
+    check(filled > 0, "S16", "precondition: a 20 s flat sag with a blind detector does trigger a fill");
+    check(hiU <= HCS_DEADBAND_H, "S16", "a fill that slipped through while driving is taken back (no ratchet)");
 }
 
 // Shadow build (the first thing flashed on a car): decides and logs, must never actuate or latch anything.
@@ -1047,7 +1095,8 @@ static void scenarioGetInAndDrive()
             for (int i = 0; i < 4; i++)
                 worstR = fmaxf(worstR, fabsf(s.h[i] - sgR[i] * twR - 50));
             printf("  end of the drive: FP %.1f RP %.1f FD %.1f RD %.1f\n", s.h[0], s.h[1], s.h[2], s.h[3]);
-            check(worstR <= HCS_DEADBAND_H + 0.5f, "S18", fmt("level while still driving: the drive-away top-up made up the load (worst %.1f)", worstR));
+            if (HCS_DRIVE_TOPUP)
+                check(worstR <= HCS_DEADBAND_H + 0.5f, "S18", fmt("level while still driving: the drive-away top-up made up the load (worst %.1f)", worstR));
         }
         s.drive(8, 0.3f, false);
         s.run(300);

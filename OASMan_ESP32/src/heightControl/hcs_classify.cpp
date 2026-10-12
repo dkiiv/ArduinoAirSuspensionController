@@ -46,8 +46,8 @@ Cls Core::classify(const Inputs &in, int i, float hm, bool pOk, int loadDir, boo
     }
     if (hm > ch + HCS_DEADBAND_H)
     {
-        if (HCS_AUTO_LOWER && airChg > 0)
-            dir = -1, goal = ch;
+        if (HCS_AUTO_LOWER && (airChg > 0 || k.autoAdded > 0.5f))
+            dir = -1, goal = airChg > 0 ? ch : fmaxf_(ch, hm - k.autoAdded);
         return Cls::CEILING;
     }
     if (fabsf(e) <= HCS_DEADBAND_H)
@@ -64,6 +64,12 @@ Cls Core::classify(const Inputs &in, int i, float hm, bool pOk, int loadDir, boo
     const Cls r = airChg > 0 ? Cls::AIR_GAIN : airElsewhere ? Cls::COUPLED : loadDir == L_DOWN ? Cls::UNLOAD
                                                                           : loadDir == L_NEUTRAL ? Cls::SHIFT : Cls::AMBIGUOUS;
     dir = (r == Cls::UNLOAD && HCS_AUTO_LOWER) ? -1 : 0;
+    // high, and we added air to this corner ourselves (a fill the road fooled us into): take ours back, never more
+    if (dir == 0 && HCS_AUTO_LOWER && k.autoAdded > 0.5f)
+    {
+        dir = -1;
+        goal = fmaxf_(k.tgt, hm - k.autoAdded);
+    }
     return r;
 }
 
@@ -229,9 +235,13 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
     // reason (a leak the parking spot hides, air added at a severe spot, load) -> ROAD corrects it by that much. Fills
     // use the full deficit; dumps only the tilt part (heat lifts all four together and goes away), unless we added air
     // since the last arrival (a min-ride lift, drive pulses).
-    float heave = 0;
+    float heave = 0, worstDef = 0;
     for (int i = 0; i < NC; i++)
+    {
         heave += 0.25f * c[i].roadDef;
+        worstDef = fmaxf_(worstDef, c[i].roadDef);
+    }
+    const bool roadLow = heave > HCS_ROAD_HEAVE_MIN; // sat low overall on the road: the corners carrying it are low for real
     Cls cls[NC];
     int8_t dir[NC];
     float goal[NC];
@@ -259,7 +269,7 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
             if (cls[i] != Cls::BOTTOM_GUARD || i == extCorner)
                 dir[i] = 0; // frozen: only the min-ride floor acts, never on the unloaded corner itself
         }
-        else if (!k.roadPending && (cls[i] == Cls::SHIFT || (arrival && cls[i] == Cls::WITHIN && k.floorOverride < 0)))
+        else if (!k.roadPending && dir[i] == 0 && (cls[i] == Cls::SHIFT || (arrival && cls[i] == Cls::WITHIN && k.floorOverride < 0)))
         {
             // terrain, or close to the preset plane on arrival: hold exactly this (references taken on THIS spot)
             k.tgt = fminf_(hm[i], ceilH());
@@ -273,16 +283,18 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
             markPersist(false);
         }
         const float dumpBy = ownAir ? k.roadDef : fmaxf_(k.roadDef, k.roadDef - heave);
-        const bool roadFill = k.roadDef > HCS_DEADBAND_H, roadDump = HCS_AUTO_LOWER && dumpBy < -HCS_DEADBAND_H;
+        const bool roadFill = k.roadDef > HCS_DEADBAND_H || (roadLow && k.roadDef > fmaxf_(HCS_ROAD_HEAVE_MIN, 0.5f * worstDef));
+        const bool roadDump = HCS_AUTO_LOWER && dumpBy < -HCS_DEADBAND_H;
         if (!externalFreeze && holdCls && k.floorOverride < 0)
         {
+            bool decidedNow = false;
             if (arrival && roadDefValid && (roadFill || roadDump))
             {
                 k.tgt = fminf_(fmaxf_(hm[i] + (roadFill ? k.roadDef : dumpBy), 0), ceilH());
-                k.roadPending = true; // finish it whatever this spot makes it look like, until inside the deadband
+                k.roadPending = decidedNow = true; // finish it (to within half the deadband) whatever this spot makes it look like
                 markPersist(false);
             }
-            if (k.roadPending && fabsf(hm[i] - k.tgt) > HCS_DEADBAND_H && (hm[i] < k.tgt || HCS_AUTO_LOWER))
+            if (k.roadPending && (decidedNow || fabsf(hm[i] - k.tgt) > 0.5f * HCS_DEADBAND_H) && (hm[i] < k.tgt || HCS_AUTO_LOWER))
             {
                 cls[i] = Cls::ROAD;
                 dir[i] = hm[i] < k.tgt ? +1 : -1;
@@ -294,6 +306,8 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
         if (cls[i] == Cls::AIR_LOSS || cls[i] == Cls::LOAD || cls[i] == Cls::UNLOAD)
             goal[i] = k.tgt;
         reref[i] = cls[i] == Cls::WITHIN && pOk[i] && fabsf(hm[i] - k.tgt) <= 0.5f * HCS_DEADBAND_H;
+        if (arrival && cls[i] == Cls::WITHIN)
+            k.autoAdded = 0; // our earlier fill proved right (the car arrived level with it)
         goal[i] = dir[i] > 0 ? fminf_(goal[i], ceilH()) : dir[i] < 0 ? fmaxf_(goal[i], liftTarget(in, i)) : goal[i];
         if ((dir[i] > 0 && goal[i] <= hm[i] + 0.5f) || (dir[i] < 0 && goal[i] >= hm[i] - 0.5f))
             dir[i] = 0;
@@ -333,7 +347,10 @@ void Core::evaluate(const Inputs &in, Outputs &out, const char *kind, bool arriv
     bool floorLift = false;
     for (int i = 0; i < NC; i++)
         floorLift = floorLift || (dir[i] > 0 && cls[i] == Cls::BOTTOM_GUARD);
-    const uint32_t confirmMs = ((afterDisturb && (now - lastMotion) < 30000UL) || floorLift) ? HCS_CONFIRM_LOAD_MS : HCS_CONFIRM_MS;
+    // ... but only at a car known to be parked (still for 2 min since its last drive): on a road the detector does
+    // not see, a bump would otherwise count as people getting in
+    const bool quick = parkedSure && ((afterDisturb && (now - lastMotion) < 30000UL) || floorLift);
+    const uint32_t confirmMs = quick ? HCS_CONFIRM_LOAD_MS : HCS_CONFIRM_MS;
     const uint32_t left = pending ? steadyRemaining(confirmMs) : 0;
     if (left != 0)
     {

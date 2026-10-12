@@ -431,7 +431,7 @@ void Core::tickManual(const Inputs &in)
         }
         k.leakFault = k.leakAllowance = k.roadPending = false;
         k.fastCount = 0;
-        k.owe = 0;
+        k.owe = k.autoAdded = 0;
         logf("COMMIT %s %s tgt=%.1f pRef=%.1f%s", CN[i], presetPending ? "preset" : "manual", k.tgt, k.pRef,
              k.floorOverride >= 0 ? " (user-held below min ride)" : "");
     }
@@ -511,8 +511,11 @@ void Core::abortBatch(Outputs &out, const char *why, State next)
     for (int i = 0; i < NC; i++)
         if (c[i].inBatch)
         {
+            Corner &k = c[i];
             out.g[i].active = true;
-            c[i].inBatch = false;
+            k.inBatch = false;
+            if (k.batchDir > 0 && k.batchOpenMs) // what was already put in (no settled reading: from the valve time)
+                k.autoAdded += k.batchOpenMs / 1000.0f * (finite_(k.fillRate) ? k.fillRate : (float)HCS_FILL_RATE_DEFAULT);
         }
     logf("ABORT batch: %s", why);
     batchSettling = urgentBatch = false;
@@ -619,6 +622,7 @@ void Core::finalizeBatch()
             continue;
         }
         const float dh = hm - k.batchH0;
+        k.autoAdded = fmaxf_(0, k.autoAdded + dh); // what we put in (and took back) ourselves
         if (k.batchDir > 0 && dh > 1.0f && k.batchOpenMs >= 300)
         {
             const float r = dh / (k.batchOpenMs / 1000.0f);

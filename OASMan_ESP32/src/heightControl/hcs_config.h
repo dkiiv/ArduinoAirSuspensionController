@@ -55,8 +55,8 @@
 #define HCS_DRIVE_CONFIRM_MS 15000 // longer episode = DRIVING, shorter = disturbance (door, person)
 #endif
 #ifndef HCS_ARRIVAL_QUIET_MS
-#define HCS_ARRIVAL_QUIET_MS 120000 // quiet after a drive / boot before evaluating (rides out red lights)
-#endif
+#define HCS_ARRIVAL_QUIET_MS 120000 // quiet after a drive / boot before evaluating (rides out red lights); after it
+#endif                              // the car counts as parked (fast confirmation for people / cargo)
 #ifndef HCS_DISTURB_QUIET_MS
 #define HCS_DISTURB_QUIET_MS 3000 // quiet after a door / person / trunk disturbance
 #endif
@@ -192,6 +192,11 @@
 // ---- driving: road level. The road is level on average; curves and braking only tilt the car, they cannot lower it
 // on average (the total load is constant). A window in which the car sits LOW overall (mean deficit versus the preset
 // > HCS_ROAD_HEAVE_MIN: load added before leaving, a leak) tops up the corners carrying that deficit.
+// Fill pulses while driving. OFF until field logs show the motion detector and the rough-road filter work on the
+// car: the build that had them on rose +16 % on rough highway. The road windows still run (arrival correction).
+#ifndef HCS_DRIVE_TOPUP
+#define HCS_DRIVE_TOPUP false
+#endif
 #ifndef HCS_ROAD_WINDOW_MS
 #define HCS_ROAD_WINDOW_MS 120000UL
 #endif

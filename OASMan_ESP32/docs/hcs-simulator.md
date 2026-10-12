@@ -16,18 +16,18 @@ HCS_DUMP_FROM=790000 HCS_DUMP_TO=800000 ./hcs_sim S1   # HCSD state lines betwee
 
 Every value in `hcs_config.h` can be overridden with `-D`, e.g. `-DHCS_MOTION_H_THRESH=1.0f`.
 
-**What a check is for.** 51 checks over 17 scenarios. Each asserts one behaviour no other check covers, or a precondition that stops a scenario from passing vacuously. Each guarded rule was disabled with a `-D` override to confirm a check fails:
+**What a check is for.** 53 checks over 17 scenarios. Each asserts one behaviour no other check covers, or a precondition that stops a scenario from passing vacuously. Each guarded rule was disabled with a `-D` override to confirm a check fails:
 
 | Override | Fails |
 |---|---|
 | `-DHCS_CONFIRM_MS=0` (no confirmation) | S16 dips |
 | `-DHCS_CONFIRM_LOAD_MS=10000` (no fast confirmation after people / cargo or below min ride) | S3 bleed, S4 |
+| `-DHCS_ARRIVAL_QUIET_MS=0` (fast confirmation without the car known parked) | S16 blind highway |
+| `-DHCS_AUTO_LOWER=false` (no dumps, incl. taking our own air back) | S4, S16 |
 | `-DHCS_URGENT_MAX_AGE_MS=0` (no lift at connect) | S19 |
-| `-DHCS_OWE_MAX=0.0f` (no drive pulses) | S15, S18 |
-| `-DHCS_ROAD_HEAVE_MIN=-100.0f` (no "sits low overall" gate) | S2 spiral ramp, S15 |
-| `-DHCS_ROAD_ROUGH_MAX=100.0f` (rough windows trusted) | S2 rough road |
-| `-DHCS_OWE_MAX=100.0f` (no per-drive cap) | S2 biased calm road |
-| `-DHCS_AUTO_LOWER=false` | S4 unload, S15, S19 |
+| `-DHCS_DRIVE_TOPUP=true -DHCS_ROAD_ROUGH_MAX=100.0f` (pulses on, rough windows trusted) | S2 rough road |
+| `-DHCS_DRIVE_TOPUP=true -DHCS_OWE_MAX=100.0f` (pulses on, no per-drive cap) | S2 biased calm road |
+| `-DHCS_DRIVE_TOPUP=true -DHCS_ROAD_HEAVE_MIN=-100.0f` (pulses on, no "sits low overall" gate) | S2 spiral ramp, S15 |
 
 ## The simulated car
 
@@ -60,8 +60,8 @@ Not modelled: bag hysteresis, tyre compliance, fast (adiabatic) compression, rea
 | S10 | fast leak (25 %/h) | latched after 3 fast refills; one refill per reconnect |
 | S11b | show preset (0 % / 0 psi), people in and out | zero automatic actions; no false fault |
 | S14 | RD compressed on the hill spot, leaking 2 %/h, 24 h connected | never latched; RD held at its arrival height |
-| S15 | 4 h road trip, RD leaking 2.5 %/h | pulses on RD only; one caught by a curve / brake starting is cut within 0.3 s; RD kept near the others |
-| S16 | dips and hill bottoms at speed (normal, glassy, long sags); then real load after parking | no fill / dump / pulse; the confirmation rule exercised; load after parking still corrected |
+| S15 | 4 h road trip, RD leaking 2.5 %/h | drive pulses off: nothing actuates; RD stays within 6 % of the others (with `-DHCS_DRIVE_TOPUP=true`: pulses on RD only, cut within 0.3 s of a curve starting) |
+| S16 | dips and hill bottoms at speed (normal, glassy, long sags); then real load after parking; a blind detector after a detected drive with bumps then flat sags; a blind 20 s flat sag | no fill / dump / pulse; the confirmation rule exercised; load after parking still corrected; a bump is not "people got in"; a fill that slipped through is taken back |
 | S17 | shadow build, leak + load 2 h | `SHADOW would START` logged; zero actuation; no leak bookkeeping from decisions that never ran |
 | S18 | get in and drive from the hill spot (no BLE overnight, loaded with the car off, leave 8 s after the driver sits); flat ground / back home / nobody drives | level while still driving; level on arrival; crown twist kept at home |
 | S19 | the owner's spot (twist ~-33 %), with the owner's car (65 psi, tank 145 / 180, min ride 20): night with an RD leak, load, connect, leave / come back / stay; plus a spot that presses corners below min ride, and a tank that can never get above the bag | lift starts the moment the controller connects; hanging corners never dumped; flat arrival level; min-ride lift on the spot; refusal logged |

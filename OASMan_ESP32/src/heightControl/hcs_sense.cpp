@@ -223,7 +223,7 @@ void Core::motionDetect()
         if (!driving && (now - episodeStart) >= HCS_DRIVE_CONFIRM_MS)
         {
             driving = armedAfterDrive = true;
-            afterDisturb = false;
+            afterDisturb = parkedSure = false;
             logf("DRIVING confirmed (motion for %lus) -> parked corrections vetoed; re-baseline on arrival",
                  (unsigned long)((now - episodeStart) / 1000));
             roadDefValid = false; // a new drive decides afresh
@@ -238,6 +238,8 @@ void Core::motionDetect()
             }
         }
     }
+    else if (!inEpisode && !parkedSure && (now - lastMotion) >= (uint32_t)HCS_ARRIVAL_QUIET_MS)
+        parkedSure = true; // still for 2 min since it last drove: disturbances from here are people / cargo, not bumps
     else if (inEpisode && (now - lastMotion) >= HCS_EPISODE_GAP_MS)
     {
         inEpisode = false;

@@ -170,6 +170,7 @@ private:
         float batchH0, batchP0, fillRate;
         uint32_t batchOpenMs;
         // driving (drive)
+        float autoAdded; // height added by our own fills since the user last set this corner: never left on the car
         bool hsOk, roadPending;
         float hS, pS, calmLo, calmHi;              // 1-s averages, calm band
         float sdH, roadDef, owe;                   // road window sum, last window's deficit, owed fill
@@ -185,7 +186,7 @@ private:
     float tank;
     bool tankValid;
     // motion
-    bool inEpisode, driving, armedAfterDrive, bootPending, afterDisturb; // afterDisturb: the last episode was a disturbance
+    bool inEpisode, driving, armedAfterDrive, bootPending, afterDisturb, parkedSure; // parkedSure: still for 2 min since the last drive
     uint32_t episodeStart, lastMotion, episodeId;
     int lastIncluded, lastVoting, lastStrong, motionRun, abortRun;
     // evaluation
