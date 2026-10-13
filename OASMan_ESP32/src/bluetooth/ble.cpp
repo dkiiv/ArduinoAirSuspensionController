@@ -328,6 +328,7 @@ static int att_write_callback(hci_con_handle_t con_handle, uint16_t att_handle, 
                 {
                     if (curVal)
                     {
+                        hcsNotifyManual(); // manual valve control always wins over the supervisor
                         Serial.print("Opening ");
                         Serial.println(i);
                         getManifold()->get(i)->open();

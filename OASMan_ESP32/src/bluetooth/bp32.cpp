@@ -198,6 +198,7 @@ void runJoystickInput(bool *val,
 {
     if (cmp)
     {
+        hcsNotifyManual(); // manual valve control always wins over the supervisor
         // open valve for left and set oasmanJoystickState flag
         a->open();
         b->open();
@@ -394,6 +395,7 @@ void joystickLoop(ControllerPtr ctl)
         {
 
             // by default we assume prev is j_none and the new leftMode is a side so we would be opening the valve
+            hcsNotifyManual(); // manual valve control always wins over the supervisor
             OpenClose openOrClose = v_open;
             JoystickMode cur = leftMode;
 
@@ -483,6 +485,7 @@ void joystickLoop(ControllerPtr ctl)
         {
 
             // by default we assume prev is j_none and the new rightMode is a side so we would be opening the valve
+            hcsNotifyManual(); // manual valve control always wins over the supervisor
             OpenClose openOrClose = v_open;
             JoystickMode cur = rightMode;
 

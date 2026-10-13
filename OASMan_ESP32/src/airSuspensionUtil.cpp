@@ -1,5 +1,6 @@
 #include "airSuspensionUtil.h"
 #include "manifoldSaveData.h"
+#include "heightControl/heightControlSupervisor.h"
 
 #pragma region variables
 
@@ -293,6 +294,7 @@ void loadProfileAirUp(int profileIndex)
     initPressureGoalWithStretch(WHEEL_REAR_PASSENGER, p.pressure[WHEEL_REAR_PASSENGER]);
     initPressureGoalWithStretch(WHEEL_FRONT_DRIVER, p.pressure[WHEEL_FRONT_DRIVER]);
     initPressureGoalWithStretch(WHEEL_REAR_DRIVER, p.pressure[WHEEL_REAR_DRIVER]);
+    hcsNotifyPresetLoad(profileIndex); // supervisor yields, then re-baselines on this preset (no-op in legacy builds)
 }
 
 void airOutWithSafetyCheck()

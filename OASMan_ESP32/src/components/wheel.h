@@ -12,6 +12,7 @@
 #include "compressor.h"
 #include "manifoldSaveData.h"
 #include "../aiPressureUtil.h" // getPredictedBagPressure / recordLearnSample
+#include "../heightControl/hcs_config.h"
 
 class Manifold; // from manifold.h, forward reference
 
@@ -27,6 +28,18 @@ private:
 
     float pressureValue;
     float levelValue;
+    float levelRawValue = 0;           // raw (pre-calibration, UNclamped) height % of the 0.5-4.5 V span, for fault checks
+    volatile uint32_t sampleSeq = 0;   // bumped on every readInputs(); lets the supervisor tell fresh samples from stale
+
+    // Autonomous (Height Control Supervisor) routine state. Only ever set by initAutonomousGoal(); every user
+    // path (initPressureGoal) clears it, so user routines behave exactly as before.
+    volatile bool autonomous = false;
+    volatile bool autoAbort = false;
+    float autoCeilH = 100.0f, autoFloorH = 0.0f, autoCeilP = MAX_PRESSURE_SAFETY;
+    bool onlyAirDown = false;
+    bool autonomousMustStop(int8_t dir);
+    bool startGoal(int newPressure, bool onlyAirUp, bool onlyAirDown, bool autonomous, std::function<void()> onComplete);
+    float normalizeLevel(float raw);
 
     int s_AirIn;
     int s_AirOut;
@@ -75,6 +88,16 @@ public:
     Wheel(int solenoidInPin, int solenoidOutPin, InputType *pressurePin, InputType *levelSensorPin, byte thisWheelNum);
     bool initPressureGoal(int newPressure, std::function<void()> onComplete = nullptr);
     bool initPressureGoal(int newPressure, bool onlyAirUp, std::function<void()> onComplete = nullptr);
+    // Supervisor-only: one-direction goal (dir +1 fill / -1 dump) with hard bounds re-checked on every routine
+    // loop: stop filling at levelValue >= ceilH or raw bag psi >= ceilP, stop dumping at levelValue <= floorH.
+    bool initAutonomousGoal(int target, int8_t dir, float ceilH, float floorH, float ceilP);
+    void requestAutonomousAbort(); // abort an autonomous routine (closes both valves); no-op for user routines
+    bool isRoutineFlagged();
+    bool isAutonomousRoutine() { return this->autonomous && this->isRoutineFlagged(); }
+    float getLevelRaw() { return this->levelRawValue; }
+    float getLevelCached() { return this->levelValue; }
+    float getPressureCached() { return this->pressureValue; }
+    uint32_t getSampleSeq() { return this->sampleSeq; }
     void loop();
     void readInputs();
     float readLevelSensorRaw();

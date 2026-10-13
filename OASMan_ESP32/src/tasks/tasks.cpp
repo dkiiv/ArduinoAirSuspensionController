@@ -2,6 +2,7 @@
 #include "airSuspensionUtil.h"
 #include "manifoldSaveData.h"
 #include "aiPressureUtil.h"
+#include "heightControl/heightControlSupervisor.h"
 
 bool bp32ServiceStarted = false;
 
@@ -177,6 +178,11 @@ void setup_tasks()
         NULL,
         1000,
         NULL);
+
+#if HEIGHT_CONTROL_SUPERVISOR
+    // Height Control Supervisor task (autonomous leveling / leak / load compensation). Legacy builds: absent.
+    hcsSetup();
+#endif
 
     //  Train AI Task
     xTaskCreate(
