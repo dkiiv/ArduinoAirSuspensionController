@@ -19,7 +19,9 @@ if [ ! -f "$HERE/hcs_logger.py" ]; then
     exit 1
 fi
 
-install -o "$USER_NAME" -g "$USER_NAME" -m 755 "$HERE/hcs_logger.py" "$HOME_DIR/hcs_logger.py"
+if [ "$HERE/hcs_logger.py" != "$HOME_DIR/hcs_logger.py" ]; then
+    install -o "$USER_NAME" -g "$USER_NAME" -m 755 "$HERE/hcs_logger.py" "$HOME_DIR/hcs_logger.py"
+fi
 install -o "$USER_NAME" -g "$USER_NAME" -d "$HOME_DIR/hcs_logs"
 usermod -aG dialout "$USER_NAME"
 
