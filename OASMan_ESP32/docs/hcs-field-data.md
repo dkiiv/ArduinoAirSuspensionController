@@ -18,7 +18,7 @@ A Zero W (v1, single core) is enough: the logger is stdlib Python at a few hundr
 4. **Logger as a service** (survives power cycles). From `OASMan_ESP32/`:
    ```
    scp eval/hcs_logger.py eval/setup_pi_logger.sh <user>@hcs-pi.local:
-   ssh <user>@hcs-pi.local sudo sh setup_pi_logger.sh
+   ssh -t <user>@hcs-pi.local sudo sh setup_pi_logger.sh
    ```
    The script installs the logger, adds the user to `dialout`, creates and starts a systemd service, and prints the port, the log directory and the collect command. Check: `tail -f ~/hcs_logs/hcs-*.log` shows `HCSD` lines once a second.
 5. **Clock:** the Pi has no RTC. Its clock is right once it has seen the home Wi-Fi (NTP) and stays right while powered; after a power loss it resumes from the last saved time until the next sync. The `HCS t=` counter is uptime in ms, so intervals are always right.
