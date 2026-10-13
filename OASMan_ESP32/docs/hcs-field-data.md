@@ -15,26 +15,12 @@ A Zero W (v1, single core) is enough: the logger is stdlib Python at a few hundr
 1. **SD card:** Raspberry Pi Imager, *Raspberry Pi OS Lite (32-bit)* (the v1 Zero is ARMv6: 64-bit images do not boot). In the Imager settings: hostname `hcs-pi`, enable SSH, a user, the home Wi-Fi (2.4 GHz only on a Zero W), timezone.
 2. **Power:** a 12 V -> 5 V buck converter (automotive type, 2-3 A) on the same always-on 12 V feed as the manifold, into the Pi's **PWR IN** micro-USB (the port at the board's edge). Draw is ~0.2 A at 5 V.
 3. **Data:** the Pi is the USB host, so the OTG adapter goes on its side: Pi **USB** port (the inner micro-USB) -> micro-USB OTG adapter (micro-B male to USB-A female) -> USB-A to USB-C cable -> ESP32. Connect the ESP32 end while parked: enumeration can reset the board once (valves close, targets reload).
-4. **Logger as a service** (survives power cycles):
+4. **Logger as a service** (survives power cycles). From `OASMan_ESP32/`:
    ```
-   scp eval/hcs_logger.py <user>@hcs-pi.local:
-   ssh <user>@hcs-pi.local
-   sudo usermod -aG dialout $USER
-   sudo tee /etc/systemd/system/hcs-logger.service >/dev/null <<EOF
-   [Unit]
-   Description=HCS serial logger
-   After=multi-user.target
-   [Service]
-   User=$USER
-   ExecStart=/usr/bin/python3 /home/$USER/hcs_logger.py --dir /home/$USER/hcs_logs
-   Restart=always
-   RestartSec=5
-   [Install]
-   WantedBy=multi-user.target
-   EOF
-   sudo systemctl enable --now hcs-logger
+   scp eval/hcs_logger.py eval/setup_pi_logger.sh <user>@hcs-pi.local:
+   ssh <user>@hcs-pi.local sudo sh setup_pi_logger.sh
    ```
-   Check: `ls /dev/ttyUSB* /dev/ttyACM*` shows the manifold; `tail -f ~/hcs_logs/hcs-*.log` shows `HCSD` lines once a second.
+   The script installs the logger, adds the user to `dialout`, creates and starts a systemd service, and prints the port, the log directory and the collect command. Check: `tail -f ~/hcs_logs/hcs-*.log` shows `HCSD` lines once a second.
 5. **Clock:** the Pi has no RTC. Its clock is right once it has seen the home Wi-Fi (NTP) and stays right while powered; after a power loss it resumes from the last saved time until the next sync. The `HCS t=` counter is uptime in ms, so intervals are always right.
 6. **Collect** (in the driveway): `scp '<user>@hcs-pi.local:hcs_logs/hcs-*.log' .` -- about 20-25 MB per day; the logger keeps 60 days.
 
